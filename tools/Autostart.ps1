@@ -1,7 +1,8 @@
 param(
     [ValidateSet('Enable','Disable','Status','Watchdog')][string]$Mode = 'Status',
     [string]$ExecutablePath,
-    [string]$ConfigUrl = 'https://yifan.im/tools/goodgoodstudy/config.json'
+    [string]$ConfigUrl = 'https://yifan.im/tools/goodgoodstudy/config.json',
+    [switch]$DeferConfigCheck
 )
 $ErrorActionPreference = 'Stop'
 $script:WatchdogScriptPath = $PSCommandPath
@@ -149,8 +150,10 @@ function Invoke-AutostartCommand([string]$Action, [string]$Exe, [string]$Url) {
             if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw 'GoodGoodStudy.exe not found.' }
             $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
             $xml = New-WatchdogTaskXml $Exe $script:WatchdogScriptPath $Url $sid
-            & $Exe --check-config $Url
-            if ($LASTEXITCODE -ne 0) { throw 'Import the device profile and validate remote configuration first.' }
+            if (-not $DeferConfigCheck) {
+                & $Exe --check-config $Url
+                if ($LASTEXITCODE -ne 0) { throw 'Import the device profile and validate remote configuration first.' }
+            }
             Register-ScheduledTask -TaskName $taskName -Xml $xml -Force | Out-Null
             $flag = Join-Path $directory 'autostart-disabled'
             if (Test-Path -LiteralPath $flag) { Remove-Item -LiteralPath $flag }

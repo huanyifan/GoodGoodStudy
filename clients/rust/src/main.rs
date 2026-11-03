@@ -1,29 +1,21 @@
-mod app;
-mod config;
-mod platform;
 use config::{Profile, Result};
+use goodgoodstudy::{app, config, load_profile, platform, save_profile};
 use std::{fs, path::Path};
 use zeroize::Zeroizing;
 
-fn load_profile(root: &Path) -> Result<Profile> {
-    let encrypted =
-        fs::read(root.join("device-profile.dpapi")).map_err(|_| "import device profile first")?;
-    let plain = Zeroizing::new(platform::dpapi(&encrypted, true)?);
-    let p: Profile = serde_json::from_slice(&plain).map_err(|_| "invalid credential")?;
-    p.validate()?;
-    Ok(p)
-}
-fn save_profile(root: &Path, p: &Profile) -> Result<()> {
-    p.validate()?;
-    let plain = Zeroizing::new(serde_json::to_vec(p).map_err(|_| "invalid credential")?);
-    let protected = platform::dpapi(&plain, false)?;
-    platform::atomic_write(&root.join("device-profile.dpapi"), &protected)
-}
 fn run(args: &[String]) -> Result<()> {
     let root = platform::state_dir()?;
     fs::create_dir_all(&root).map_err(|_| "state directory unavailable")?;
     if let Some(command) = args.first() {
         match command.as_str() {
+            "--stop-instance" => {
+                if args.len() != 1 {
+                    return Err("invalid arguments");
+                }
+                platform::stop_existing(20000)?;
+                println!("GoodGoodStudy instance stopped or not running.");
+                return Ok(());
+            }
             "--create-profile" => {
                 if args.len() != 2 || root.join("device-profile.dpapi").exists() {
                     return Err("profile already exists or invalid arguments");

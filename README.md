@@ -9,7 +9,25 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 
 本版修复空路径、批次越界、ZIP 重名和资源释放问题，提供邮件失败队列、登录自启动与每分钟进程守护。配置采用 **设备鉴权 + HTTPS + 每次请求临时 ECDH 密钥协商 + AES-256-CBC/HMAC-SHA256**。
 
-## 首次使用
+## Rust 一键安装（主要发布方式）
+
+双击为当前设备制作的 **GoodGoodStudy-Rust-Setup-3.2.0.personal.exe** 即可。安装器自动解压到 `%LOCALAPPDATA%\Programs\GoodGoodStudy`，将内置设备凭据用当前用户 DPAPI 保存，然后启用登录自启动、每分钟进程守护并立即启动。无需导入或选择配置。安装使用当前用户权限；已存在的有效设备凭据会保留。
+
+开始菜单的 GoodGoodStudy 文件夹提供状态、停用、启用和卸载入口；Windows 的已安装应用中也有卸载入口。卸载停止程序、移除任务和安装文件，保留 `%LOCALAPPDATA%\GoodGoodStudy` 中的截图、日志与设备凭据。安装时不能联网也可完成本地配置，守护任务之后重试获取远端配置。
+
+个人安装包内置长期**设备访问凭据**，持有人能够提取它并请求配置，必须私下保管，不能发布到 GitHub、公开下载目录或共享盘。临时 ECDH 私钥和会话加密密钥仍只存在于运行内存中。安装过程不会把内置凭据解压为明文文件。
+
+管理员在本机使用已登记的设备凭据构建：
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Build-Installer.ps1 -ProfilePath C:\private\client-profile.json
+~~~
+
+需要 Rust MSVC 工具链、Visual Studio Build Tools 与 Windows SDK。默认输出到当前用户独占 ACL 的 `%LOCALAPPDATA%\GoodGoodStudyBuilds\3.2.0`。构建执行 Rust 与安装器测试，并对最终 EXE 验证真实远端鉴权；验证模式不安装、不截图、不发邮件。安装包只收录运行必需文件，不包含源码、其他语言版本、构建缓存或服务器明文配置。
+
+Rust 是后续主要开发和发布项目；Go 与 VB.NET 保留为对照和迁移参考。
+
+## 便携版手动使用（高级用法）
 
 1. 选择 Rust 或 Go 程序包，解压到固定的本地目录，保留 EXE 与 tools 目录。
 2. 在实际运行截图程序的 Windows 用户下，将私下提供的设备凭据文件拖到包内 **Import-Profile.cmd**，或运行：

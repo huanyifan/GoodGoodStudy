@@ -315,6 +315,9 @@ paket-files/
 # Python Tools for Visual Studio (PTVS)
 __pycache__/
 clients/rust/target/
+installer/target/
+*.personal.exe
+*.payload.zip
 clients/go/bin/
 artifacts/
 *.pyc

@@ -35,6 +35,8 @@ extern "system" {
         initial: i32,
         name: *const u16,
     ) -> Handle;
+    fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> Handle;
+    fn OpenMutexW(access: u32, inherit: i32, name: *const u16) -> Handle;
     fn SetEvent(handle: Handle) -> i32;
     fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
     fn CreateFileW(
@@ -96,6 +98,37 @@ fn text(value: &str) -> Vec<u16> {
 pub fn state_dir() -> Result<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA missing")?;
     Ok(PathBuf::from(root).join("GoodGoodStudy"))
+}
+
+pub fn stop_existing(timeout_ms: u32) -> Result<()> {
+    let id = sid()?;
+    let event_name = text(&format!("Local\\GoodGoodStudyStop-{}", id));
+    let mutex_name = text(&format!("Local\\GoodGoodStudy-{}", id));
+    unsafe {
+        let event = OpenEventW(2, 0, event_name.as_ptr());
+        if !event.is_null() {
+            SetEvent(event);
+            CloseHandle(event);
+        }
+        let mutex = OpenMutexW(0x00100001, 0, mutex_name.as_ptr());
+        if mutex.is_null() {
+            return if GetLastError() == 2 {
+                Ok(())
+            } else {
+                Err("existing instance status unavailable")
+            };
+        }
+        let result = WaitForSingleObject(mutex, timeout_ms);
+        if result == 0 || result == 0x80 {
+            ReleaseMutex(mutex);
+        }
+        CloseHandle(mutex);
+        if result == 0 || result == 0x80 {
+            Ok(())
+        } else {
+            Err("existing instance has not stopped")
+        }
+    }
 }
 pub fn sid() -> Result<String> {
     unsafe {
