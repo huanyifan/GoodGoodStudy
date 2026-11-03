@@ -1,0 +1,442 @@
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use p256::{ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey};
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{path::Path, time::Duration};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+pub type Result<T> = std::result::Result<T, &'static str>;
+pub const ENDPOINT: &str = "https://yifan.im/tools/goodgoodstudy/config.json";
+pub const PROTOCOL: &str = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v2";
+pub const ALGORITHM: &str = "AES-256-CBC+HMAC-SHA256";
+
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    pub device_id: String,
+    pub access_token: String,
+}
+impl Profile {
+    pub fn create() -> Self {
+        let mut token = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *token);
+        Self {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            access_token: B64.encode(token.as_slice()),
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.device_id.len() != 36 || uuid::Uuid::parse_str(&self.device_id).is_err() {
+            return Err("invalid device ID");
+        }
+        let token = Zeroizing::new(
+            B64.decode(&self.access_token)
+                .map_err(|_| "invalid credential")?,
+        );
+        if token.len() != 32 || B64.encode(&*token) != self.access_token {
+            return Err("invalid credential");
+        }
+        Ok(())
+    }
+}
+#[derive(Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MailConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub enable_ssl: bool,
+    pub sender: String,
+    pub recipient: String,
+    pub username: String,
+    pub password: String,
+}
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: 587,
+            enable_ssl: true,
+            sender: String::new(),
+            recipient: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+#[derive(Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Config {
+    pub interval_seconds: u32,
+    pub batch_size: usize,
+    pub screenshot_directory: String,
+    pub retention_days: u32,
+    #[serde(rename = "maxStorageMB")]
+    pub max_storage_mb: u32,
+    pub mail: MailConfig,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            interval_seconds: 180,
+            batch_size: 10,
+            screenshot_directory: String::new(),
+            retention_days: 7,
+            max_storage_mb: 512,
+            mail: MailConfig::default(),
+        }
+    }
+}
+impl Config {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 65536 {
+            return Err("configuration too large");
+        }
+        let c: Self = serde_json::from_slice(bytes).map_err(|_| "invalid configuration")?;
+        if !(1..=86400).contains(&c.interval_seconds)
+            || !(1..=100).contains(&c.batch_size)
+            || !(1..=365).contains(&c.retention_days)
+            || !(16..=8192).contains(&c.max_storage_mb)
+        {
+            return Err("configuration range invalid");
+        }
+        if !c.screenshot_directory.is_empty() && !Path::new(&c.screenshot_directory).is_absolute() {
+            return Err("directory must be absolute");
+        }
+        if c.mail.enabled {
+            if c.mail.host.is_empty()
+                || c.mail.port == 0
+                || c.mail.port == 465
+                || !c.mail.enable_ssl
+                || c.mail.username.is_empty()
+                || c.mail.password.is_empty()
+            {
+                return Err("invalid SMTP settings");
+            }
+            let _: lettre::message::Mailbox =
+                c.mail.sender.parse().map_err(|_| "invalid sender")?;
+            let _: lettre::message::Mailbox =
+                c.mail.recipient.parse().map_err(|_| "invalid recipient")?;
+        }
+        Ok(c)
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Handshake {
+    version: u8,
+    device_id: String,
+    client_public_key: String,
+    client_nonce: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Envelope {
+    version: u8,
+    algorithm: String,
+    iv: String,
+    ciphertext: String,
+    mac: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Response {
+    version: u8,
+    key_agreement: String,
+    server_public_key: String,
+    server_nonce: String,
+    payload: Envelope,
+}
+pub struct Session {
+    secret: EphemeralSecret,
+    pub request: Handshake,
+    point: Vec<u8>,
+    nonce: [u8; 32],
+}
+impl Session {
+    pub fn new(device: &str) -> Self {
+        let secret = EphemeralSecret::random(&mut OsRng);
+        let point = PublicKey::from(&secret)
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let request = Handshake {
+            version: 2,
+            device_id: device.to_owned(),
+            client_public_key: B64.encode(&point),
+            client_nonce: B64.encode(nonce),
+        };
+        Self {
+            secret,
+            request,
+            point,
+            nonce,
+        }
+    }
+    pub fn decrypt(&self, r: &Response) -> Result<Config> {
+        if r.version != 2
+            || r.key_agreement != PROTOCOL
+            || r.payload.version != 1
+            || r.payload.algorithm != ALGORITHM
+        {
+            return Err("invalid session response");
+        }
+        let public = B64
+            .decode(&r.server_public_key)
+            .map_err(|_| "invalid point")?;
+        if public.len() != 65 || public[0] != 4 {
+            return Err("invalid point");
+        }
+        let peer = PublicKey::from_sec1_bytes(&public).map_err(|_| "invalid point")?;
+        let nonce = B64.decode(&r.server_nonce).map_err(|_| "invalid nonce")?;
+        if nonce.len() != 32 {
+            return Err("invalid nonce");
+        }
+        let shared = self.secret.diffie_hellman(&peer);
+        let hashed = Zeroizing::new(Sha256::digest(shared.raw_secret_bytes()).to_vec());
+        let mut salt = self.nonce.to_vec();
+        salt.extend_from_slice(&nonce);
+        let mut info = format!("{}|{}|", PROTOCOL, self.request.device_id).into_bytes();
+        info.extend_from_slice(&self.point);
+        info.extend_from_slice(&public);
+        info.extend_from_slice(&self.nonce);
+        info.extend_from_slice(&nonce);
+        let mut key = Zeroizing::new([0u8; 64]);
+        Hkdf::<Sha256>::new(Some(&salt), &hashed)
+            .expand(&info, &mut *key)
+            .map_err(|_| "HKDF failed")?;
+        let iv = B64.decode(&r.payload.iv).map_err(|_| "invalid IV")?;
+        if iv.len() != 16 {
+            return Err("invalid IV");
+        }
+        let ciphertext = B64
+            .decode(&r.payload.ciphertext)
+            .map_err(|_| "invalid ciphertext")?;
+        if ciphertext.is_empty() || ciphertext.len() % 16 != 0 || ciphertext.len() > 65552 {
+            return Err("invalid ciphertext");
+        }
+        let tag = B64.decode(&r.payload.mac).map_err(|_| "invalid MAC")?;
+        if tag.len() != 32 {
+            return Err("invalid MAC");
+        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key[32..]).map_err(|_| "MAC failed")?;
+        mac.update(format!("GoodGoodStudy.Config.v1|{}|", ALGORITHM).as_bytes());
+        mac.update(&iv);
+        mac.update(&ciphertext);
+        mac.verify_slice(&tag)
+            .map_err(|_| "authentication failed")?;
+        let decryptor = cbc::Decryptor::<aes::Aes256>::new_from_slices(&key[..32], &iv)
+            .map_err(|_| "cipher failed")?;
+        let plain = Zeroizing::new(
+            decryptor
+                .decrypt_padded_vec_mut::<Pkcs7>(&ciphertext)
+                .map_err(|_| "cipher failed")?,
+        );
+        Config::parse(&plain)
+    }
+}
+pub fn fetch(address: &str, profile: &Profile) -> Result<Config> {
+    profile.validate()?;
+    let url = reqwest::Url::parse(address).map_err(|_| "invalid URL")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("HTTPS required");
+    }
+    let session = Session::new(&profile.device_id);
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "HTTPS unavailable")?;
+    let response = client
+        .post(url)
+        .bearer_auth(&profile.access_token)
+        .json(&session.request)
+        .send()
+        .map_err(|_| "HTTPS configuration unavailable")?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err("configuration access failed");
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    response
+        .take(131073)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "response read failed")?;
+    if bytes.len() > 131072 {
+        return Err("response too large");
+    }
+    let r: Response = serde_json::from_slice(&bytes).map_err(|_| "invalid session response")?;
+    session.decrypt(&r)
+}
+pub fn parse_ini(data: &str) -> Result<Config> {
+    let mut values = std::collections::HashMap::new();
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(['[', ';', '#']) {
+            continue;
+        }
+        let (k, v) = line.split_once('=').ok_or("invalid INI")?;
+        values.insert(k.trim(), v.trim().trim_matches(['\'', '"']));
+    }
+    let value = |key: &str| values.get(key).copied().ok_or("missing INI field");
+    let interval: u32 = value("timeInterval")?
+        .parse()
+        .map_err(|_| "invalid interval")?;
+    let c = Config {
+        interval_seconds: interval.checked_mul(60).ok_or("invalid interval")?,
+        mail: MailConfig {
+            enabled: true,
+            host: value("smtpServer")?.to_owned(),
+            sender: value("senderMail")?.to_owned(),
+            recipient: value("toMail")?.to_owned(),
+            username: value("senderMail")?.to_owned(),
+            password: value("tokenCode")?.to_owned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let data = Zeroizing::new(serde_json::to_vec(&c).map_err(|_| "invalid configuration")?);
+    Config::parse(&data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    fn reply(client: &Session) -> Response {
+        let secret = EphemeralSecret::random(&mut OsRng);
+        let public = PublicKey::from(&secret)
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let peer = PublicKey::from_sec1_bytes(&client.point).unwrap();
+        let shared = secret.diffie_hellman(&peer);
+        let hashed = Zeroizing::new(Sha256::digest(shared.raw_secret_bytes()).to_vec());
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let mut salt = client.nonce.to_vec();
+        salt.extend_from_slice(&nonce);
+        let mut info = format!("{}|{}|", PROTOCOL, client.request.device_id).into_bytes();
+        info.extend_from_slice(&client.point);
+        info.extend_from_slice(&public);
+        info.extend_from_slice(&client.nonce);
+        info.extend_from_slice(&nonce);
+        let mut key = Zeroizing::new([0u8; 64]);
+        Hkdf::<Sha256>::new(Some(&salt), &hashed)
+            .expand(&info, &mut *key)
+            .unwrap();
+        let mut iv = [0u8; 16];
+        OsRng.fill_bytes(&mut iv);
+        let encrypted = cbc::Encryptor::<aes::Aes256>::new_from_slices(&key[..32], &iv)
+            .unwrap()
+            .encrypt_padded_vec_mut::<Pkcs7>(br#"{"intervalSeconds":42}"#);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key[32..]).unwrap();
+        mac.update(format!("GoodGoodStudy.Config.v1|{}|", ALGORITHM).as_bytes());
+        mac.update(&iv);
+        mac.update(&encrypted);
+        Response {
+            version: 2,
+            key_agreement: PROTOCOL.into(),
+            server_public_key: B64.encode(public),
+            server_nonce: B64.encode(nonce),
+            payload: Envelope {
+                version: 1,
+                algorithm: ALGORITHM.into(),
+                iv: B64.encode(iv),
+                ciphertext: B64.encode(encrypted),
+                mac: B64.encode(mac.finalize().into_bytes()),
+            },
+        }
+    }
+    #[test]
+    fn session_round_trip() {
+        let s = Session::new(&uuid::Uuid::new_v4().to_string());
+        assert_eq!(s.decrypt(&reply(&s)).unwrap().interval_seconds, 42);
+    }
+    #[test]
+    fn replay_rejected() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let s = Session::new(&id);
+        let other = Session::new(&id);
+        assert!(other.decrypt(&reply(&s)).is_err());
+    }
+    #[test]
+    fn fresh_ephemeral_response() {
+        let s = Session::new(&uuid::Uuid::new_v4().to_string());
+        let a = reply(&s);
+        let b = reply(&s);
+        assert_ne!(a.server_public_key, b.server_public_key);
+        assert_ne!(a.server_nonce, b.server_nonce);
+        assert_ne!(a.payload.ciphertext, b.payload.ciphertext);
+    }
+    #[test]
+    fn tampering_rejected() {
+        let s = Session::new(&uuid::Uuid::new_v4().to_string());
+        for field in ["mac", "iv", "ciphertext", "nonce"] {
+            let mut r = reply(&s);
+            let value = match field {
+                "mac" => &mut r.payload.mac,
+                "iv" => &mut r.payload.iv,
+                "ciphertext" => &mut r.payload.ciphertext,
+                _ => &mut r.server_nonce,
+            };
+            let mut bytes = B64.decode(&*value).unwrap();
+            bytes[0] ^= 1;
+            *value = B64.encode(bytes);
+            assert!(s.decrypt(&r).is_err());
+        }
+    }
+    #[test]
+    fn configuration_boundaries() {
+        for value in [
+            "null",
+            r#"{"mail":null}"#,
+            r#"{"intervalSeconds":0}"#,
+            r#"{"batchSize":0}"#,
+            r#"{"maxStorageMB":1}"#,
+            r#"{"mail":{"enabled":true}}"#,
+            r#"{"screenshotDirectory":"relative"}"#,
+        ] {
+            assert!(Config::parse(value.as_bytes()).is_err())
+        }
+        let c = Config::parse(b"{}").unwrap();
+        assert_eq!(c.batch_size, 10);
+        assert!(c.screenshot_directory.is_empty());
+    }
+    #[test]
+    fn profile_validation() {
+        let p = Profile::create();
+        assert!(p.validate().is_ok());
+        let mut bad = Profile::create();
+        bad.access_token = "invalid".into();
+        assert!(bad.validate().is_err());
+    }
+    #[test]
+    fn url_policy() {
+        let p = Profile::create();
+        for url in [
+            "http://example.com",
+            "https://user:password@example.com",
+            "https://example.com/#fragment",
+        ] {
+            assert!(fetch(url, &p).is_err());
+        }
+    }
+    #[test]
+    fn ini_conversion() {
+        let c=parse_ini("senderMail=sender@example.com\nsmtpServer=smtp.example.com\ntokenCode=synthetic-test-only\ntoMail=recipient@example.com\ntimeInterval=3").unwrap();
+        assert_eq!(c.interval_seconds, 180);
+        assert!(c.mail.enabled);
+    }
+}

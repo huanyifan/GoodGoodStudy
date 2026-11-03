@@ -80,6 +80,8 @@
     <Compile Include="ModuleMain.vb" />
     <Compile Include="AppConfig.vb" />
     <Compile Include="ConfigCrypto.vb" />
+    <Compile Include="ConfigSession.vb" />
+    <Compile Include="ClientProfile.vb" />
     <Compile Include="ConfigCommands.vb" />
     <Compile Include="RemoteConfig.vb" />
     <Compile Include="CaptureStore.vb" />

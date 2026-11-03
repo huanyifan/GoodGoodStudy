@@ -20,7 +20,7 @@ Public Class CaptureRunner
         store = New CaptureStore(capturePath, Path.Combine(stateDirectory, "pending"))
     End Sub
 
-    Public Sub Run(stopSignal As ManualResetEvent)
+    Public Sub Run(stopSignal As EventWaitHandle)
         Dim sender As Thread = Nothing
         If config.mail.enabled Then
             sender = New Thread(Sub() SendPending(stopSignal)) With {.IsBackground = True}
@@ -74,7 +74,7 @@ Public Class CaptureRunner
         End Try
     End Sub
 
-    Private Sub SendPending(stopSignal As ManualResetEvent)
+    Private Sub SendPending(stopSignal As EventWaitHandle)
         Dim retrySeconds = 5
         Do While Not stopSignal.WaitOne(0)
             Try

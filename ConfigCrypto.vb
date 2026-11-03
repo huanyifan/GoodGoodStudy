@@ -14,7 +14,6 @@ End Class
 
 Public NotInheritable Class ConfigCrypto
     Public Const Algorithm As String = "AES-256-CBC+HMAC-SHA256"
-    Private Shared ReadOnly Entropy As Byte() = Encoding.UTF8.GetBytes("GoodGoodStudy.ConfigKey.v1")
 
     Public Shared Function GenerateKey() As Byte()
         Dim result(63) As Byte
@@ -92,17 +91,6 @@ Public NotInheritable Class ConfigCrypto
         End Using
     End Function
 
-    Public Shared Function LoadKey(stateDirectory As String) As Byte()
-        Dim result = ProtectedData.Unprotect(File.ReadAllBytes(Path.Combine(stateDirectory, "config-key.dpapi")), Entropy, DataProtectionScope.CurrentUser)
-        ValidateKey(result)
-        Return result
-    End Function
-
-    Public Shared Sub SaveKey(stateDirectory As String, key As Byte())
-        ValidateKey(key)
-        Directory.CreateDirectory(stateDirectory)
-        AtomicFile.WriteBytes(Path.Combine(stateDirectory, "config-key.dpapi"), ProtectedData.Protect(key, Entropy, DataProtectionScope.CurrentUser))
-    End Sub
 End Class
 
 Public NotInheritable Class AtomicFile

@@ -23,9 +23,9 @@ Module ModuleMain
                 End Try
                 If Not acquired Then Throw New InvalidOperationException("Already running.")
                 Try
-                    Dim loader As New RemoteConfig(stateDirectory, ConfigCrypto.LoadKey(stateDirectory), AddressOf RuntimeLog.Write)
+                    Dim loader As New RemoteConfig(ClientProfile.Load(stateDirectory), AddressOf RuntimeLog.Write)
                     Dim config = loader.Load(configUrl)
-                    Using stopSignal As New ManualResetEvent(False)
+                    Using stopSignal As New EventWaitHandle(False, EventResetMode.ManualReset, "Local\GoodGoodStudyStop-" & System.Security.Principal.WindowsIdentity.GetCurrent().User.Value)
                         AddHandler Console.CancelKeyPress, Sub(sender, e)
                                                                e.Cancel = True
                                                                stopSignal.Set()

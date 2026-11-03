@@ -9,6 +9,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
     & '.\Tests\bin\Release\GoodGoodStudy.Tests.exe'
     if ($LASTEXITCODE -ne 0) { throw 'Regression checks failed' }
+    & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass -File '.\Tests\Autostart.Tests.ps1'
+    if ($LASTEXITCODE -ne 0) { throw 'Autostart checks failed' }
 } finally {
     Pop-Location
 }
