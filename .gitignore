@@ -361,3 +361,11 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# GoodGoodStudy local secrets and generated configuration
+*.key
+*.dpapi
+config.json
+config.plain.json
+config.ini
+!config.example.json

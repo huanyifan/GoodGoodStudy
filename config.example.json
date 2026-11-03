@@ -1,0 +1,17 @@
+{
+  "intervalSeconds": 180,
+  "batchSize": 10,
+  "screenshotDirectory": "",
+  "retentionDays": 7,
+  "maxStorageMB": 512,
+  "mail": {
+    "enabled": false,
+    "host": "",
+    "port": 587,
+    "enableSsl": true,
+    "sender": "",
+    "recipient": "",
+    "username": "",
+    "password": ""
+  }
+}

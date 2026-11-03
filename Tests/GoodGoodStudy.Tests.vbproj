@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>GoodGoodStudy.Tests</RootNamespace>
+    <AssemblyName>GoodGoodStudy.Tests</AssemblyName>
+    <StartupObject>GoodGoodStudy.Tests.TestMain</StartupObject>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <OptionStrict>On</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Security" />
+    <Import Include="System" />
+    <Import Include="System.Collections.Generic" />
+    <Compile Include="TestMain.vb" />
+    <ProjectReference Include="..\GoodGoodStudy.vbproj">
+      <Name>GoodGoodStudy</Name>
+      <Project>{C7A677C8-ABD6-46D6-A2E6-0016A8899BF3}</Project>
+    </ProjectReference>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.VisualBasic.targets" />
+</Project>
