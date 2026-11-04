@@ -183,6 +183,9 @@ fn run(args: &[String]) -> Result<()> {
 }
 fn main() {
     if let Err(error) = run(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        if let Ok(root) = platform::state_dir() {
+            app::log(&root, error);
+        }
         if std::env::args()
             .nth(1)
             .is_some_and(|arg| matches!(arg.as_str(), "--debug-config" | "--debug-crypto"))

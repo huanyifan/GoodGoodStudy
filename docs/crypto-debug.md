@@ -30,3 +30,11 @@ python -B .\tools\debug_crypto.py --exe C:\private\GoodGoodStudy.exe --output-di
 - 私钥、Z、IKM、两把派生密钥、访问令牌、邮箱地址、SMTP 密码和完整配置明文均不打印；不会为诊断额外记录这些秘密的指纹。
 - 工具断言双方公钥、nonce、HKDF 公开输入和加密信封一致；篡改 MAC、IV、密文或服务器 nonce 必须被拒绝；旧响应交给另一个临时会话必须被拒绝。两次线上请求的双方公钥、nonce、IV、密文摘要必须变化。
 - 跨会话重放检测依靠临时密钥和握手绑定；同一 Session 对象重复处理同一合法响应没有单独的已消费标记。生产获取流程每次创建新 Session，仅处理一次响应。
+
+## 真实截图运行测试
+
+显式运行 `powershell -NoProfile -ExecutionPolicy Bypass -File tools/Test-Runtime.ps1 -ExecutablePath C:\private\GoodGoodStudy.exe`，可测试正常运行入口，而非仅测试配置接口。需要已导入当前用户 DPAPI 设备凭据，且当前 HTTPS 配置为默认截图目录、120 秒间隔、批量大小至少 2。脚本先通过真实接口核对这些条件，不符合时拒绝启动测试。
+
+脚本在当前用户私有构建目录创建独立测试数据目录，复制 DPAPI 密文凭据，仅为子进程覆盖 LOCALAPPDATA；正常后台运行程序，检查第二实例被拒绝，等待一张真实截图，发出正常停止事件，验证 PNG 可解码、退出码为 0、邮件队列为空。结果在该目录的 runtime-test.json、stdout.log、stderr.log 和 GoodGoodStudy/runtime.log 中；图片也保留在该私有目录。不会安装登录启动任务或等待累积到发送批次。
+
+普通运行失败也会将脱敏静态原因写入 runtime.log；HTTPS 传输失败时，stderr 仅补充连接类别、超时标志和操作系统错误码，不输出请求头、令牌或完整网络异常对象。

@@ -311,6 +311,7 @@ impl Session {
                 "cipher":"AES-256-CBC", "padding":"PKCS#7, 16-byte blocks", "paddingValid":true,
                 "plaintextBytes":plain.len(), "jsonValid":true, "configurationRangesValid":true,
                 "intervalSeconds":config.interval_seconds, "batchSize":config.batch_size,
+            "usesDefaultScreenshotDirectory":config.screenshot_directory.is_empty(),
                 "mailEnabled":config.mail.enabled, "smtpPort":config.mail.port, "smtpTls":config.mail.enable_ssl,
                 "mailAddressesAndPassword":"[redacted]", "plaintextConfiguration":"[redacted]"
             }),
@@ -369,7 +370,26 @@ pub fn fetch_with_trace(
         .bearer_auth(&profile.access_token)
         .json(&session.request)
         .send()
-        .map_err(|_| "HTTPS configuration unavailable")?;
+        .map_err(|error| {
+            use std::error::Error;
+            let mut codes = Vec::new();
+            let mut cause = error.source();
+            while let Some(value) = cause {
+                if let Some(io) = value.downcast_ref::<std::io::Error>() {
+                    if let Some(code) = io.raw_os_error() {
+                        codes.push(code);
+                    }
+                }
+                cause = value.source();
+            }
+            eprintln!(
+                "HTTPS transport failed: connect={}, timeout={}, os_codes={:?}",
+                error.is_connect(),
+                error.is_timeout(),
+                codes
+            );
+            "HTTPS configuration unavailable"
+        })?;
     emit(
         &mut trace,
         "03.https_response",
