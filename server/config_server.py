@@ -36,7 +36,7 @@ def unb64(value, length):
         raise ValueError("invalid field length")
     return result
 
-def make_response(request, configuration):
+def make_response(request, configuration, trace=None):
     if request.get("version") != 2:
         raise ValueError("unsupported version")
     device = request["deviceId"]
@@ -48,12 +48,24 @@ def make_response(request, configuration):
     ephemeral = ec.generate_private_key(ec.SECP256R1())
     server_public = ephemeral.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
     server_nonce = os.urandom(32)
+    if trace:
+        trace("01.validate_client_and_generate_ephemeral", curve="P-256 / secp256r1",
+            clientPublicKey=b64(client_public), clientNonce=b64(client_nonce),
+            serverPublicKey=b64(server_public), serverNonce=b64(server_nonce),
+            pointOnCurve=True, privateKey="[memory only; redacted]")
     # Windows CNG's SHA256 KDF hashes the raw ECDH agreement before HKDF.
     hashed_secret = bytearray(hashlib.sha256(ephemeral.exchange(ec.ECDH(), peer)).digest())
     info = (PROTOCOL + "|" + device + "|").encode("utf-8") + client_public + server_public + client_nonce + server_nonce
     session_key = bytearray(HKDF(algorithm=hashes.SHA256(), length=64,
         salt=client_nonce + server_nonce, info=info).derive(bytes(hashed_secret)))
     try:
+        if trace:
+            trace("02.ecdh_sha256_hkdf", calculation="Z = ECDH(server_private, client_public); IKM = SHA256(Z)",
+                saltLayout="client_nonce[32] || server_nonce[32]", saltBase64=b64(client_nonce + server_nonce),
+                infoLayout="UTF8(protocol + '|' + device_id + '|') || client_public[65] || server_public[65] || client_nonce[32] || server_nonce[32]",
+                infoBytes=len(info), infoSha256=hashlib.sha256(info).hexdigest(),
+                outputBytes=64, split="OKM[0..32] AES-256 key; OKM[32..64] HMAC-SHA256 key",
+                sharedSecretAndDerivedKeys="[memory only; redacted]")
         plain = json.dumps(configuration, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(plain) > MAX_CONFIG:
             raise ValueError("configuration too large")
@@ -64,12 +76,22 @@ def make_response(request, configuration):
         ciphertext = encryptor.update(padded) + encryptor.finalize()
         prefix = ("GoodGoodStudy.Config.v1|" + ALGORITHM + "|").encode("ascii")
         tag = hmac.new(bytes(session_key[32:]), prefix + iv + ciphertext, hashlib.sha256).digest()
+        if trace:
+            trace("03.aes_encrypt_and_authenticate", cipher="AES-256-CBC", padding="PKCS#7, 16-byte blocks",
+                plaintextBytes=len(plain), plaintextConfiguration="[redacted]", paddedBytes=len(padded),
+                ivBase64=b64(iv), ivBytes=len(iv), ciphertextBytes=len(ciphertext),
+                ciphertextSha256=hashlib.sha256(ciphertext).hexdigest(), macBase64=b64(tag),
+                macInputLayout="ASCII('GoodGoodStudy.Config.v1|" + ALGORITHM + "|') || IV[16] || ciphertext",
+                macBytes=len(tag), order="encrypt then MAC; client must verify MAC before decryption")
         return {"version": 2, "keyAgreement": PROTOCOL, "serverPublicKey": b64(server_public),
             "serverNonce": b64(server_nonce), "payload": {"version": 1, "algorithm": ALGORITHM,
             "iv": b64(iv), "ciphertext": b64(ciphertext), "mac": b64(tag)}}
     finally:
         hashed_secret[:] = b"\0" * len(hashed_secret)
         session_key[:] = b"\0" * len(session_key)
+        if trace:
+            trace("04.cleanup", zeroedBuffers=["hashed_secret", "session_key"], keyPersistence=False,
+                limitation="Python/OpenSSL temporary copies are runtime-managed; zeroing these buffers is not a guarantee of erasing every copy")
 
 class ConfigService:
     def __init__(self, data_dir):

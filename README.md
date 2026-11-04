@@ -73,6 +73,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Autostart.ps1 -M
 
 ## 临时密钥与设备鉴权
 
+需要查看双方实际加解密步骤时，参见 [本机与线上加解密调试](docs/crypto-debug.md)。Rust 的 `--debug-config` 输出真实 HTTPS 请求的脱敏跟踪；`--debug-crypto` 运行本机 Rust/Python 双方协议互通与篡改检查，不启动截图或发信。
+
 每次获取配置：
 
 1. 客户端生成内存中的临时 P-256 ECDH 私钥、公钥和 32 字节随机 nonce；提交设备 ID、公钥、nonce，并在 HTTPS Authorization 中携带设备访问凭据。

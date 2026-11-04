@@ -13,6 +13,13 @@ pub const ENDPOINT: &str = "https://yifan.im/tools/goodgoodstudy/config.json";
 pub const PROTOCOL: &str = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v2";
 pub const ALGORITHM: &str = "AES-256-CBC+HMAC-SHA256";
 
+pub type TraceSink<'a> = Option<&'a mut dyn FnMut(serde_json::Value)>;
+fn emit(sink: &mut TraceSink<'_>, step: &str, details: serde_json::Value) {
+    if let Some(write) = sink {
+        write(serde_json::json!({"side":"client", "step":step, "details":details}));
+    }
+}
+
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -180,6 +187,20 @@ impl Session {
         }
     }
     pub fn decrypt(&self, r: &Response) -> Result<Config> {
+        self.decrypt_with_trace(r, None)
+    }
+    pub fn trace_handshake(&self, mut trace: TraceSink<'_>) {
+        emit(
+            &mut trace,
+            "01.generate_ephemeral_handshake",
+            serde_json::json!({
+                "curve":"P-256 / secp256r1", "publicKeyEncoding":"SEC1 uncompressed, 65 bytes (04 || X || Y), Base64",
+                "clientPublicKey":self.request.client_public_key, "clientNonce":self.request.client_nonce,
+                "nonceBytes":32, "deviceId":"[redacted]", "privateKey":"[memory only; redacted]"
+            }),
+        );
+    }
+    pub fn decrypt_with_trace(&self, r: &Response, mut trace: TraceSink<'_>) -> Result<Config> {
         if r.version != 2
             || r.key_agreement != PROTOCOL
             || r.payload.version != 1
@@ -198,8 +219,26 @@ impl Session {
         if nonce.len() != 32 {
             return Err("invalid nonce");
         }
+        emit(
+            &mut trace,
+            "04.validate_server_handshake",
+            serde_json::json!({
+                "version":r.version, "protocol":r.key_agreement, "algorithm":r.payload.algorithm,
+                "serverPublicKey":r.server_public_key, "serverNonce":r.server_nonce,
+                "pointOnCurve":true, "serverNonceBytes":nonce.len()
+            }),
+        );
         let shared = self.secret.diffie_hellman(&peer);
         let hashed = Zeroizing::new(Sha256::digest(shared.raw_secret_bytes()).to_vec());
+        emit(
+            &mut trace,
+            "05.ecdh_and_sha256",
+            serde_json::json!({
+                "calculation":"Z = ECDH(client_private, server_public); IKM = SHA256(Z)",
+                "serverEquivalent":"Z = ECDH(server_private, client_public)",
+                "rawSecretBytes":32, "ikmBytes":32, "privateKey":"[redacted]", "Z":"[redacted]", "IKM":"[redacted]"
+            }),
+        );
         let mut salt = self.nonce.to_vec();
         salt.extend_from_slice(&nonce);
         let mut info = format!("{}|{}|", PROTOCOL, self.request.device_id).into_bytes();
@@ -211,6 +250,17 @@ impl Session {
         Hkdf::<Sha256>::new(Some(&salt), &hashed)
             .expand(&info, &mut *key)
             .map_err(|_| "HKDF failed")?;
+        emit(
+            &mut trace,
+            "06.hkdf_sha256",
+            serde_json::json!({
+                "saltLayout":"client_nonce[32] || server_nonce[32]", "saltBase64":B64.encode(&salt),
+                "infoLayout":"UTF8(protocol + '|' + device_id + '|') || client_public[65] || server_public[65] || client_nonce[32] || server_nonce[32]",
+                "infoBytes":info.len(), "infoSha256":format!("{:x}",Sha256::digest(&info)),
+                "outputBytes":64, "split":"OKM[0..32] = AES-256 key; OKM[32..64] = HMAC-SHA256 key",
+                "keys":"[memory only; redacted]"
+            }),
+        );
         let iv = B64.decode(&r.payload.iv).map_err(|_| "invalid IV")?;
         if iv.len() != 16 {
             return Err("invalid IV");
@@ -225,12 +275,27 @@ impl Session {
         if tag.len() != 32 {
             return Err("invalid MAC");
         }
+        emit(
+            &mut trace,
+            "07.encrypted_envelope",
+            serde_json::json!({
+                "ivBase64":r.payload.iv, "ivBytes":iv.len(), "ciphertextBytes":ciphertext.len(),
+                "ciphertextSha256":format!("{:x}",Sha256::digest(&ciphertext)), "macBase64":r.payload.mac,
+                "macInputLayout":format!("ASCII('GoodGoodStudy.Config.v1|{}|') || IV[16] || ciphertext",ALGORITHM),
+                "macBytes":tag.len(), "verification":"constant-time HMAC verify before AES decryption"
+            }),
+        );
         let mut mac = Hmac::<Sha256>::new_from_slice(&key[32..]).map_err(|_| "MAC failed")?;
         mac.update(format!("GoodGoodStudy.Config.v1|{}|", ALGORITHM).as_bytes());
         mac.update(&iv);
         mac.update(&ciphertext);
         mac.verify_slice(&tag)
             .map_err(|_| "authentication failed")?;
+        emit(
+            &mut trace,
+            "08.hmac_verified",
+            serde_json::json!({"valid":true, "decryptAllowed":true}),
+        );
         let decryptor = cbc::Decryptor::<aes::Aes256>::new_from_slices(&key[..32], &iv)
             .map_err(|_| "cipher failed")?;
         let plain = Zeroizing::new(
@@ -238,10 +303,37 @@ impl Session {
                 .decrypt_padded_vec_mut::<Pkcs7>(&ciphertext)
                 .map_err(|_| "cipher failed")?,
         );
-        Config::parse(&plain)
+        let config = Config::parse(&plain)?;
+        emit(
+            &mut trace,
+            "09.aes_decrypt_and_validate",
+            serde_json::json!({
+                "cipher":"AES-256-CBC", "padding":"PKCS#7, 16-byte blocks", "paddingValid":true,
+                "plaintextBytes":plain.len(), "jsonValid":true, "configurationRangesValid":true,
+                "intervalSeconds":config.interval_seconds, "batchSize":config.batch_size,
+                "mailEnabled":config.mail.enabled, "smtpPort":config.mail.port, "smtpTls":config.mail.enable_ssl,
+                "mailAddressesAndPassword":"[redacted]", "plaintextConfiguration":"[redacted]"
+            }),
+        );
+        emit(
+            &mut trace,
+            "10.session_lifetime",
+            serde_json::json!({
+                "keyPersistence":false, "plaintextCache":false,
+                "cleanup":"Rust Zeroizing buffers / cryptographic type drop; no private keys or session key bytes emitted"
+            }),
+        );
+        Ok(config)
     }
 }
 pub fn fetch(address: &str, profile: &Profile) -> Result<Config> {
+    fetch_with_trace(address, profile, None)
+}
+pub fn fetch_with_trace(
+    address: &str,
+    profile: &Profile,
+    mut trace: TraceSink<'_>,
+) -> Result<Config> {
     profile.validate()?;
     let url = reqwest::Url::parse(address).map_err(|_| "invalid URL")?;
     if url.scheme() != "https"
@@ -253,6 +345,20 @@ pub fn fetch(address: &str, profile: &Profile) -> Result<Config> {
         return Err("HTTPS required");
     }
     let session = Session::new(&profile.device_id);
+    session.trace_handshake(
+        trace
+            .as_mut()
+            .map(|sink| &mut **sink as &mut dyn FnMut(serde_json::Value)),
+    );
+    emit(
+        &mut trace,
+        "02.https_request",
+        serde_json::json!({
+            "method":"POST", "host":url.host_str(), "path":url.path(), "tlsCertificateVerification":true,
+            "redirectsAllowed":false, "timeoutSeconds":15, "authorization":"Bearer [redacted]",
+            "requestBody":"version, deviceId, clientPublicKey, clientNonce; no private key or session encryption key"
+        }),
+    );
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
@@ -264,6 +370,11 @@ pub fn fetch(address: &str, profile: &Profile) -> Result<Config> {
         .json(&session.request)
         .send()
         .map_err(|_| "HTTPS configuration unavailable")?;
+    emit(
+        &mut trace,
+        "03.https_response",
+        serde_json::json!({"status":response.status().as_u16()}),
+    );
     if response.status() != reqwest::StatusCode::OK {
         return Err("configuration access failed");
     }
@@ -277,7 +388,7 @@ pub fn fetch(address: &str, profile: &Profile) -> Result<Config> {
         return Err("response too large");
     }
     let r: Response = serde_json::from_slice(&bytes).map_err(|_| "invalid session response")?;
-    session.decrypt(&r)
+    session.decrypt_with_trace(&r, trace)
 }
 pub fn parse_ini(data: &str) -> Result<Config> {
     let mut values = std::collections::HashMap::new();
@@ -315,6 +426,9 @@ mod tests {
     use super::*;
     use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     fn reply(client: &Session) -> Response {
+        reply_with_plain(client, br#"{"intervalSeconds":42}"#)
+    }
+    fn reply_with_plain(client: &Session, plain: &[u8]) -> Response {
         let secret = EphemeralSecret::random(&mut OsRng);
         let public = PublicKey::from(&secret)
             .to_encoded_point(false)
@@ -340,7 +454,7 @@ mod tests {
         OsRng.fill_bytes(&mut iv);
         let encrypted = cbc::Encryptor::<aes::Aes256>::new_from_slices(&key[..32], &iv)
             .unwrap()
-            .encrypt_padded_vec_mut::<Pkcs7>(br#"{"intervalSeconds":42}"#);
+            .encrypt_padded_vec_mut::<Pkcs7>(plain);
         let mut mac = Hmac::<Sha256>::new_from_slice(&key[32..]).unwrap();
         mac.update(format!("GoodGoodStudy.Config.v1|{}|", ALGORITHM).as_bytes());
         mac.update(&iv);
@@ -363,6 +477,48 @@ mod tests {
     fn session_round_trip() {
         let s = Session::new(&uuid::Uuid::new_v4().to_string());
         assert_eq!(s.decrypt(&reply(&s)).unwrap().interval_seconds, 42);
+    }
+    #[test]
+    fn debug_trace_redacts_config_and_never_decrypts_unauthenticated_data() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let s = Session::new(&id);
+        let mut response = reply_with_plain(&s, br#"{"mail":{"password":"SYNTHETIC-DO-NOT-LOG-SECRET","sender":"private@example.test","username":"SYNTHETIC-USERNAME"}}"#);
+        let mut events = Vec::new();
+        s.trace_handshake(Some(&mut |event| events.push(event)));
+        s.decrypt_with_trace(&response, Some(&mut |event| events.push(event)))
+            .unwrap();
+        let log = serde_json::to_string(&events).unwrap();
+        for value in [
+            &id,
+            "SYNTHETIC-DO-NOT-LOG-SECRET",
+            "private@example.test",
+            "SYNTHETIC-USERNAME",
+        ] {
+            assert!(!log.contains(value));
+        }
+        let steps: Vec<_> = events.iter().map(|e| e["step"].as_str().unwrap()).collect();
+        let authenticated = steps
+            .iter()
+            .position(|step| *step == "08.hmac_verified")
+            .unwrap();
+        let decrypted = steps
+            .iter()
+            .position(|step| *step == "09.aes_decrypt_and_validate")
+            .unwrap();
+        assert!(authenticated < decrypted);
+        let mut tag = B64.decode(&response.payload.mac).unwrap();
+        tag[0] ^= 1;
+        response.payload.mac = B64.encode(tag);
+        events.clear();
+        assert_eq!(
+            s.decrypt_with_trace(&response, Some(&mut |event| events.push(event)))
+                .err(),
+            Some("authentication failed")
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e["step"].as_str(),
+            Some("08.hmac_verified" | "09.aes_decrypt_and_validate")
+        )));
     }
     #[test]
     fn replay_rejected() {
