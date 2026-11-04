@@ -11,7 +11,7 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 
 ## Rust 一键安装（主要发布方式）
 
-双击为当前设备制作的 **GoodGoodStudy-Rust-Setup-3.2.0.personal.exe** 即可。安装器自动解压到 `%LOCALAPPDATA%\Programs\GoodGoodStudy`，将内置设备凭据用当前用户 DPAPI 保存，然后启用登录自启动、每分钟进程守护并立即启动。无需导入或选择配置。安装使用当前用户权限；已存在的有效设备凭据会保留。
+双击为当前设备制作的 **GoodGoodStudy-Rust-Setup-3.2.1.personal.exe** 即可。安装器自动解压到 `%LOCALAPPDATA%\Programs\GoodGoodStudy`，将内置设备凭据用当前用户 DPAPI 保存，然后启用登录自启动、每分钟进程守护并立即启动。无需导入或选择配置。安装使用当前用户权限；已存在的有效设备凭据会保留。
 
 开始菜单的 GoodGoodStudy 文件夹提供状态、停用、启用和卸载入口；Windows 的已安装应用中也有卸载入口。卸载停止程序、移除任务和安装文件，保留 `%LOCALAPPDATA%\GoodGoodStudy` 中的截图、日志与设备凭据。安装时不能联网也可完成本地配置，守护任务之后重试获取远端配置。
 
@@ -23,7 +23,7 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Build-Installer.ps1 -ProfilePath C:\private\client-profile.json
 ~~~
 
-需要 Rust MSVC 工具链、Visual Studio Build Tools 与 Windows SDK。默认输出到当前用户独占 ACL 的 `%LOCALAPPDATA%\GoodGoodStudyBuilds\3.2.0`。构建执行 Rust 与安装器测试，并对最终 EXE 验证真实远端鉴权；验证模式不安装、不截图、不发邮件。安装包只收录运行必需文件，不包含源码、其他语言版本、构建缓存或服务器明文配置。
+需要 Rust MSVC 工具链、Visual Studio Build Tools 与 Windows SDK。默认输出到当前用户独占 ACL 的 `%LOCALAPPDATA%\GoodGoodStudyBuilds\3.2.1`。构建执行 Rust 与安装器测试，并对最终 EXE 验证真实远端鉴权；验证模式不安装、不截图、不发邮件。安装包只收录运行必需文件，不包含源码、其他语言版本、构建缓存或服务器明文配置。
 
 Rust 是后续主要开发和发布项目；Go 与 VB.NET 保留为对照和迁移参考。
 
@@ -57,7 +57,7 @@ https://yifan.im/tools/goodgoodstudy/config.json
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Autostart.ps1 -Mode Enable -ConfigUrl https://example.com/tools/goodgoodstudy/config.json
 ~~~
 
-配置在启动时获取，更改后重启生效。请求只接受 HTTPS，校验系统 TLS 证书，拒绝重定向，整体超时 15 秒，响应最大 128 KiB。没有离线配置缓存；服务器不可达或凭据被撤销时，本次启动停止，守护任务会在后续分钟重试。
+配置在启动时获取，更改后重启生效。请求只接受 HTTPS，校验系统 TLS 证书，拒绝重定向；单次连接超时 5 秒、完整请求超时 15 秒，响应最大 128 KiB。3.2.1 对网络传输失败及 HTTP 502/503/504 最多尝试 3 次，间隔 1、2 秒，每次使用全新的临时密钥与 nonce；停止操作可取消等待。TLS 错误、鉴权或限流失败、无效配置及 HMAC 失败不重试。最坏约 48 秒后仍失败则退出，守护任务后续按分钟重试；没有离线配置缓存。
 
 ## 自启动与进程守护
 

@@ -13,8 +13,9 @@ def require(condition, message):
 
 def event(events, side, step):
     matches = [item for item in events if item.get("side") == side and item.get("step") == step]
-    require(len(matches) == 1, "Missing or duplicate trace event: " + step)
-    return matches[0]["details"]
+    require(bool(matches), "Missing trace event: " + step)
+    # Each network retry has a fresh handshake; compare the final attempt.
+    return matches[-1]["details"]
 
 
 def main():

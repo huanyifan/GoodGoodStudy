@@ -241,7 +241,30 @@ fn sender(config: Arc<Config>, queue: PathBuf, root: PathBuf, stop: StopEvent) {
 }
 pub fn run(address: &str, root: &Path) -> Result<()> {
     let guard = Guard::acquire()?;
-    let config = Arc::new(config::fetch(address, &load_profile(root)?)?);
+    let mut observe = |event: serde_json::Value| {
+        let step = event["step"].as_str().unwrap_or("");
+        if matches!(step, "11.retry_scheduled" | "12.transport_failure")
+            || (step == "03.https_response" && event["details"]["status"].as_u64() != Some(200))
+        {
+            if let Ok(message) = serde_json::to_string(&event) {
+                log(root, &message);
+            }
+        }
+    };
+    let result = config::fetch_cancellable(
+        address,
+        &load_profile(root)?,
+        Some(&mut observe),
+        &mut |delay| {
+            guard
+                .stop
+                .wait(delay.as_millis().min(u32::MAX as u128) as u32)
+        },
+    );
+    if guard.stop.wait(0) {
+        return Ok(());
+    }
+    let config = Arc::new(result?);
     let directory = if config.screenshot_directory.is_empty() {
         root.join("captures")
     } else {

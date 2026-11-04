@@ -1,6 +1,6 @@
 param([Parameter(Mandatory=$true)][string]$ExecutablePath)
 $ErrorActionPreference='Stop'
-$build=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.0'
+$build=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.1'
 $testBase=Join-Path $build ('runtime-tests\'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
 $testState=Join-Path $testBase 'GoodGoodStudy'
 [IO.Directory]::CreateDirectory($testState)|Out-Null
@@ -19,7 +19,7 @@ $preflight=[Diagnostics.Process]::Start($info)
 try {
  $preOut=$preflight.StandardOutput.ReadToEndAsync()
  $preErr=$preflight.StandardError.ReadToEndAsync()
- if(-not $preflight.WaitForExit(25000)){$preflight.Kill();throw 'Configuration preflight timed out'}
+ if(-not $preflight.WaitForExit(60000)){$preflight.Kill();throw 'Configuration preflight timed out'}
  if($preflight.ExitCode -ne 0){throw 'Configuration preflight failed; runtime test not started'}
  $configEvent=@($preOut.GetAwaiter().GetResult() -split '\r?\n' | Where-Object {$_ -like '{*'} | ForEach-Object {$_|ConvertFrom-Json} | Where-Object step -eq '09.aes_decrypt_and_validate')
  if($configEvent.Count -ne 1){throw 'Preflight configuration summary missing'}
@@ -50,7 +50,7 @@ try {
   Write-Output 'Duplicate-instance protection passed; waiting for first scheduled screenshot (120-second interval).'
  } finally { $second.Dispose() }
  $captures=Join-Path $testState 'captures'
- $limit=$started.AddSeconds(165)
+ $limit=$started.AddSeconds(190)
  $image=$null
  while([DateTime]::UtcNow -lt $limit){
   if($process.HasExited){throw ('Rust stopped before capture: '+$process.ExitCode)}
@@ -58,7 +58,7 @@ try {
   if($image){break}
   Start-Sleep -Seconds 2
  }
- if(-not $image){throw 'No screenshot arrived within 165 seconds'}
+ if(-not $image){throw 'No screenshot arrived within 190 seconds'}
  Start-Sleep -Seconds 1
  $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
  $event=[Threading.EventWaitHandle]::OpenExisting('Local\GoodGoodStudyStop-'+$sid)

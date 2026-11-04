@@ -29,6 +29,7 @@ python -B .\tools\debug_crypto.py --exe C:\private\GoodGoodStudy.exe --output-di
 - 日志打印双方公钥、nonce、IV、HMAC、密文长度与摘要，以及 HKDF salt、info 布局／长度／摘要。双方公开参数完全匹配且 HMAC、解密成功，证明本次派生与加解密互通。
 - 私钥、Z、IKM、两把派生密钥、访问令牌、邮箱地址、SMTP 密码和完整配置明文均不打印；不会为诊断额外记录这些秘密的指纹。
 - 工具断言双方公钥、nonce、HKDF 公开输入和加密信封一致；篡改 MAC、IV、密文或服务器 nonce 必须被拒绝；旧响应交给另一个临时会话必须被拒绝。两次线上请求的双方公钥、nonce、IV、密文摘要必须变化。
+- 3.2.1 的每次网络重试会重新产生握手；调试工具关联最终成功尝试的参数。`00.fetch_attempt`、`11.retry_scheduled`、`12.transport_failure` 分别记录尝试次数、等待与脱敏传输错误。正常运行只把重试、传输故障及非200状态写入 runtime.log，不落盘正常握手参数。
 - 跨会话重放检测依靠临时密钥和握手绑定；同一 Session 对象重复处理同一合法响应没有单独的已消费标记。生产获取流程每次创建新 Session，仅处理一次响应。
 
 ## 真实截图运行测试
@@ -38,3 +39,9 @@ python -B .\tools\debug_crypto.py --exe C:\private\GoodGoodStudy.exe --output-di
 脚本在当前用户私有构建目录创建独立测试数据目录，复制 DPAPI 密文凭据，仅为子进程覆盖 LOCALAPPDATA；正常后台运行程序，检查第二实例被拒绝，等待一张真实截图，发出正常停止事件，验证 PNG 可解码、退出码为 0、邮件队列为空。结果在该目录的 runtime-test.json、stdout.log、stderr.log 和 GoodGoodStudy/runtime.log 中；图片也保留在该私有目录。不会安装登录启动任务或等待累积到发送批次。
 
 普通运行失败也会将脱敏静态原因写入 runtime.log；HTTPS 传输失败时，stderr 仅补充连接类别、超时标志和操作系统错误码，不输出请求头、令牌或完整网络异常对象。
+
+## 启动稳定性与 HTTPS 故障注入
+
+`tools/Test-Startup.ps1 -ExecutablePath <Rust-EXE> -Attempts 20` 在独立空数据目录逐次启动正常程序，一旦进入运行状态就正常停止，不等待首张截图。结果在私有构建目录的 stability-tests 下，逐次记录启动、重试次数和退出码；没有邮件队列可发送。
+
+需要 Python 与 cryptography 时，可在 clients/rust 目录显式执行 `cargo test --locked --lib real_https_faults -- --ignored --nocapture`。测试使用回环 HTTPS 与即时生成的合成 CA，该 CA 仅加入测试客户端内存，不导入 Windows 根证书库。覆盖断连、读响应中断、超时、502/503/504 后恢复、三次耗尽、401/403/429/500 不重试、无效 JSON／MAC 不重试、错误证书不重试及取消等待。测试同时断言重试的公钥和 nonce 不重复。生产客户端没有导入测试 CA 或跳过证书校验的入口。

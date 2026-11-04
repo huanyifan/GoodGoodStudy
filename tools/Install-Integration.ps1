@@ -47,7 +47,7 @@ try {
     $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $uninstall='"'+$powershell+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $actual 'Uninstall.ps1')+'"'
     foreach($property in @{
-        DisplayName='GoodGoodStudy Rust'; DisplayVersion='3.2.0'; Publisher='GoodGoodStudy';
+        DisplayName='GoodGoodStudy Rust'; DisplayVersion='3.2.1'; Publisher='GoodGoodStudy';
         InstallLocation=$actual; DisplayIcon=$exe; UninstallString=$uninstall;
         InstallDate=(Get-Date).ToString('yyyyMMdd')
     }.GetEnumerator()) {

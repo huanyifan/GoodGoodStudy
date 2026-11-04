@@ -330,10 +330,68 @@ impl Session {
 pub fn fetch(address: &str, profile: &Profile) -> Result<Config> {
     fetch_with_trace(address, profile, None)
 }
-pub fn fetch_with_trace(
+pub fn fetch_with_trace(address: &str, profile: &Profile, trace: TraceSink<'_>) -> Result<Config> {
+    fetch_cancellable(address, profile, trace, &mut |delay| {
+        std::thread::sleep(delay);
+        false
+    })
+}
+
+#[derive(Debug)]
+struct FetchFailure {
+    message: &'static str,
+    retryable: bool,
+}
+impl From<&'static str> for FetchFailure {
+    fn from(message: &'static str) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
+}
+impl FetchFailure {
+    fn transient(message: &'static str) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+}
+fn retryable_transport(error: &reqwest::Error) -> bool {
+    use std::error::Error;
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(value) = cause {
+        // TLS/certificate failures are not treated as temporary TCP failures.
+        if value.downcast_ref::<native_tls::Error>().is_some() {
+            return false;
+        }
+        cause = value.source();
+    }
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+}
+fn client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+}
+pub fn fetch_cancellable(
+    address: &str,
+    profile: &Profile,
+    trace: TraceSink<'_>,
+    wait: &mut dyn FnMut(Duration) -> bool,
+) -> Result<Config> {
+    let client = client_builder().build().map_err(|_| "HTTPS unavailable")?;
+    fetch_using_client(address, profile, trace, wait, &client)
+}
+fn fetch_using_client(
     address: &str,
     profile: &Profile,
     mut trace: TraceSink<'_>,
+    wait: &mut dyn FnMut(Duration) -> bool,
+    client: &reqwest::blocking::Client,
 ) -> Result<Config> {
     profile.validate()?;
     let url = reqwest::Url::parse(address).map_err(|_| "invalid URL")?;
@@ -345,6 +403,48 @@ pub fn fetch_with_trace(
     {
         return Err("HTTPS required");
     }
+    for attempt in 1..=3 {
+        if wait(Duration::ZERO) {
+            return Err("configuration fetch cancelled");
+        }
+        emit(
+            &mut trace,
+            "00.fetch_attempt",
+            serde_json::json!({"attempt":attempt,"maximumAttempts":3}),
+        );
+        let result = fetch_attempt(&url, profile, &mut trace, client);
+        match result {
+            Ok(config) => return Ok(config),
+            Err(error) if error.retryable && attempt < 3 => {
+                let delay = Duration::from_secs(attempt);
+                emit(
+                    &mut trace,
+                    "11.retry_scheduled",
+                    serde_json::json!({
+                        "attempt":attempt,"reason":error.message,"delaySeconds":delay.as_secs(),
+                        "nextHandshake":"fresh ephemeral key and nonce"
+                    }),
+                );
+                eprintln!(
+                    "Configuration retry: attempt={attempt}/3, delay={}s, reason={}",
+                    delay.as_secs(),
+                    error.message
+                );
+                if wait(delay) {
+                    return Err("configuration fetch cancelled");
+                }
+            }
+            Err(error) => return Err(error.message),
+        }
+    }
+    Err("configuration attempts exhausted")
+}
+fn fetch_attempt(
+    url: &reqwest::Url,
+    profile: &Profile,
+    trace: &mut TraceSink<'_>,
+    client: &reqwest::blocking::Client,
+) -> std::result::Result<Config, FetchFailure> {
     let session = Session::new(&profile.device_id);
     session.trace_handshake(
         trace
@@ -352,21 +452,16 @@ pub fn fetch_with_trace(
             .map(|sink| &mut **sink as &mut dyn FnMut(serde_json::Value)),
     );
     emit(
-        &mut trace,
+        trace,
         "02.https_request",
         serde_json::json!({
             "method":"POST", "host":url.host_str(), "path":url.path(), "tlsCertificateVerification":true,
-            "redirectsAllowed":false, "timeoutSeconds":15, "authorization":"Bearer [redacted]",
+            "redirectsAllowed":false, "timeoutSeconds":15, "connectTimeoutSeconds":5, "authorization":"Bearer [redacted]",
             "requestBody":"version, deviceId, clientPublicKey, clientNonce; no private key or session encryption key"
         }),
     );
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|_| "HTTPS unavailable")?;
     let response = client
-        .post(url)
+        .post(url.clone())
         .bearer_auth(&profile.access_token)
         .json(&session.request)
         .send()
@@ -383,32 +478,57 @@ pub fn fetch_with_trace(
                 cause = value.source();
             }
             eprintln!(
-                "HTTPS transport failed: connect={}, timeout={}, os_codes={:?}",
+                "HTTPS transport failed: connect={}, timeout={}, retryable={}, os_codes={:?}",
                 error.is_connect(),
                 error.is_timeout(),
+                retryable_transport(&error),
                 codes
             );
-            "HTTPS configuration unavailable"
+            emit(
+                trace,
+                "12.transport_failure",
+                serde_json::json!({
+                    "connect":error.is_connect(),"timeout":error.is_timeout(),
+                    "retryable":retryable_transport(&error),"osCodes":codes
+                }),
+            );
+            FetchFailure {
+                message: "HTTPS configuration unavailable",
+                retryable: retryable_transport(&error),
+            }
         })?;
     emit(
-        &mut trace,
+        trace,
         "03.https_response",
         serde_json::json!({"status":response.status().as_u16()}),
     );
-    if response.status() != reqwest::StatusCode::OK {
-        return Err("configuration access failed");
+    let status = response.status();
+    if matches!(status.as_u16(), 502..=504) {
+        return Err(FetchFailure::transient(
+            "configuration service temporarily unavailable",
+        ));
+    }
+    if status != reqwest::StatusCode::OK {
+        return Err("configuration access failed".into());
     }
     use std::io::Read;
     let mut bytes = Vec::new();
     response
         .take(131073)
         .read_to_end(&mut bytes)
-        .map_err(|_| "response read failed")?;
+        .map_err(|_| FetchFailure::transient("response read failed"))?;
     if bytes.len() > 131072 {
-        return Err("response too large");
+        return Err("response too large".into());
     }
     let r: Response = serde_json::from_slice(&bytes).map_err(|_| "invalid session response")?;
-    session.decrypt_with_trace(&r, trace)
+    session
+        .decrypt_with_trace(
+            &r,
+            trace
+                .as_mut()
+                .map(|sink| &mut **sink as &mut dyn FnMut(serde_json::Value)),
+        )
+        .map_err(FetchFailure::from)
 }
 pub fn parse_ini(data: &str) -> Result<Config> {
     let mut values = std::collections::HashMap::new();
@@ -440,6 +560,10 @@ pub fn parse_ini(data: &str) -> Result<Config> {
     let data = Zeroizing::new(serde_json::to_vec(&c).map_err(|_| "invalid configuration")?);
     Config::parse(&data)
 }
+
+#[cfg(test)]
+#[path = "retry_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {

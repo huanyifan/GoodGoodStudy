@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use zip::ZipArchive;
 
 pub type Result<T> = std::result::Result<T, &'static str>;
-pub const VERSION: &str = "3.2.0";
+pub const VERSION: &str = "3.2.1";
 pub const PROFILE_ENTRY: &str = "provisioning/device-profile.json";
 pub const FILES: &[&str] = &[
     "GoodGoodStudy.exe",
