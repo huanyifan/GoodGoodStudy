@@ -11,7 +11,7 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 
 ## Rust 一键安装（主要发布方式）
 
-双击为当前设备制作的 **GoodGoodStudy-Rust-Setup-3.2.1.personal.exe** 即可。安装器自动解压到 `%LOCALAPPDATA%\Programs\GoodGoodStudy`，将内置设备凭据用当前用户 DPAPI 保存，然后启用登录自启动、每分钟进程守护并立即启动。无需导入或选择配置。安装使用当前用户权限；已存在的有效设备凭据会保留。
+双击为当前设备制作的 **GoodGoodStudy-Rust-Setup-3.2.2.personal.exe** 即可。安装器自动解压到 `%LOCALAPPDATA%\Programs\GoodGoodStudy`，将内置设备凭据用当前用户 DPAPI 保存，然后启用登录自启动、每分钟进程守护并立即启动。无需导入或选择配置。安装使用当前用户权限；已存在的有效设备凭据会保留。
 
 开始菜单的 GoodGoodStudy 文件夹提供状态、停用、启用和卸载入口；Windows 的已安装应用中也有卸载入口。卸载停止程序、移除任务和安装文件，保留 `%LOCALAPPDATA%\GoodGoodStudy` 中的截图、日志与设备凭据。安装时不能联网也可完成本地配置，守护任务之后重试获取远端配置。
 
@@ -23,7 +23,7 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Build-Installer.ps1 -ProfilePath C:\private\client-profile.json
 ~~~
 
-需要 Rust MSVC 工具链、Visual Studio Build Tools 与 Windows SDK。默认输出到当前用户独占 ACL 的 `%LOCALAPPDATA%\GoodGoodStudyBuilds\3.2.1`。构建执行 Rust 与安装器测试，并对最终 EXE 验证真实远端鉴权；验证模式不安装、不截图、不发邮件。安装包只收录运行必需文件，不包含源码、其他语言版本、构建缓存或服务器明文配置。
+需要 Rust MSVC 工具链、Visual Studio Build Tools 与 Windows SDK。默认输出到当前用户独占 ACL 的 `%LOCALAPPDATA%\GoodGoodStudyBuilds\3.2.2`。构建执行 Rust 与安装器测试，并对最终 EXE 验证真实远端鉴权；验证模式不安装、不截图、不发邮件。安装包只收录运行必需文件，不包含源码、其他语言版本、构建缓存或服务器明文配置。
 
 Rust 是后续主要开发和发布项目；Go 与 VB.NET 保留为对照和迁移参考。
 
@@ -131,7 +131,9 @@ handle /tools/goodgoodstudy/config.json {
 .\GoodGoodStudy.exe --convert-ini C:\private\config.ini C:\private\server-config.private.json
 ~~~
 
-转换结果是仅当前用户可读的服务端私有明文配置，不是可公开上传的静态文件；只部署到上述私有目录。旧 timeInterval 按分钟转换为秒，每批 10 张，SMTP 使用 STARTTLS 587。如邮箱要求其他设置，请使用 JSON 配置调整。端口 465 的隐式 TLS 不受当前 SmtpClient 实现支持。
+转换结果是仅当前用户可读的服务端私有明文配置，不是可公开上传的静态文件；只部署到上述私有目录。旧 timeInterval 按分钟转换为秒，每批 10 张。Rust 3.2.2 支持 465/994 隐式 TLS，其余端口要求 STARTTLS，均校验证书；关闭 TLS 的配置会被拒绝。163 邮箱 INI 默认转换为465，其他主机默认587，也可通过可选 smtpPort 字段明确指定。旧版 Rust、Go 和 VB.NET 对照实现不能直接沿用新的465配置。
+
+真实发信测试说明见 [邮件代码测试](docs/mail-test.md)。普通 cargo test 会跳过真实发信；只有显式运行对应 ignored 测试才发送一封标注主题、带合成文字 ZIP 的邮件。
 
 ## 配置字段与运行行为
 

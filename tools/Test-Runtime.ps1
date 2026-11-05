@@ -1,6 +1,6 @@
 param([Parameter(Mandatory=$true)][string]$ExecutablePath)
 $ErrorActionPreference='Stop'
-$build=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.1'
+$build=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.2'
 $testBase=Join-Path $build ('runtime-tests\'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
 $testState=Join-Path $testBase 'GoodGoodStudy'
 [IO.Directory]::CreateDirectory($testState)|Out-Null

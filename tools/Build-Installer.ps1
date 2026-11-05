@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$ProfilePath,
-    [string]$OutputDirectory=(Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.1')
+    [string]$OutputDirectory=(Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.2')
 )
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -61,7 +61,7 @@ try {
     }
     $manifest=$zip.CreateEntry('manifest.json').Open()
     try {
-        $bytes=[Text.Encoding]::UTF8.GetBytes((@{version='3.2.1';sha256=$hashes}|ConvertTo-Json -Depth 4 -Compress))
+        $bytes=[Text.Encoding]::UTF8.GetBytes((@{version='3.2.2';sha256=$hashes}|ConvertTo-Json -Depth 4 -Compress))
         $manifest.Write($bytes,0,$bytes.Length)
     } finally { $manifest.Dispose() }
 } finally { $zip.Dispose(); $stream.Dispose() }
@@ -73,7 +73,7 @@ try {
     Cargo @('clippy','--locked','--all-targets','--','-D','warnings')
     Cargo @('build','--release','--locked')
 } finally { Pop-Location; Remove-Item Env:GGS_INSTALL_PAYLOAD -ErrorAction SilentlyContinue }
-$exe=Join-Path $output 'GoodGoodStudy-Rust-Setup-3.2.1.personal.exe'
+$exe=Join-Path $output 'GoodGoodStudy-Rust-Setup-3.2.2.personal.exe'
 Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\goodgoodstudy-setup.exe') -Destination $exe -Force
 $report=Join-Path $output ('verification-'+[Guid]::NewGuid().ToString('N')+'.json')
 $process=Start-Process -FilePath $exe -ArgumentList @('--verify-online',('"'+$report+'"')) -WindowStyle Hidden -Wait -PassThru

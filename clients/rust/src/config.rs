@@ -117,7 +117,6 @@ impl Config {
         if c.mail.enabled {
             if c.mail.host.is_empty()
                 || c.mail.port == 0
-                || c.mail.port == 465
                 || !c.mail.enable_ssl
                 || c.mail.username.is_empty()
                 || c.mail.password.is_empty()
@@ -549,6 +548,13 @@ pub fn parse_ini(data: &str) -> Result<Config> {
         mail: MailConfig {
             enabled: true,
             host: value("smtpServer")?.to_owned(),
+            port: if let Some(port) = values.get("smtpPort") {
+                port.parse().map_err(|_| "invalid SMTP port")?
+            } else if value("smtpServer")?.eq_ignore_ascii_case("smtp.163.com") {
+                465
+            } else {
+                587
+            },
             sender: value("senderMail")?.to_owned(),
             recipient: value("toMail")?.to_owned(),
             username: value("senderMail")?.to_owned(),
@@ -738,5 +744,28 @@ mod tests {
         let c=parse_ini("senderMail=sender@example.com\nsmtpServer=smtp.example.com\ntokenCode=synthetic-test-only\ntoMail=recipient@example.com\ntimeInterval=3").unwrap();
         assert_eq!(c.interval_seconds, 180);
         assert!(c.mail.enabled);
+    }
+    #[test]
+    fn secure_smtp_ports_and_163_ini_conversion() {
+        for port in [465, 994, 587] {
+            let data = format!(
+                r#"{{"mail":{{"enabled":true,"host":"smtp.example.test","port":{port},"enableSsl":true,"sender":"sender@example.test","recipient":"recipient@example.test","username":"synthetic-user","password":"synthetic-only"}}}}"#
+            );
+            assert_eq!(Config::parse(data.as_bytes()).unwrap().mail.port, port);
+            assert!(Config::parse(
+                data.replace("\"enableSsl\":true", "\"enableSsl\":false")
+                    .as_bytes()
+            )
+            .is_err());
+        }
+        let ini="senderMail=sender@example.test\nsmtpServer=smtp.163.com\ntokenCode=synthetic-only\ntoMail=recipient@example.test\ntimeInterval=2";
+        assert_eq!(parse_ini(ini).unwrap().mail.port, 465);
+        assert_eq!(
+            parse_ini(&(ini.to_owned() + "\nsmtpPort=994"))
+                .unwrap()
+                .mail
+                .port,
+            994
+        );
     }
 }

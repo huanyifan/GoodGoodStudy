@@ -161,18 +161,28 @@ pub fn archive(queue: &Path, sources: &[PathBuf]) -> Result<PathBuf> {
     Ok(final_path)
 }
 fn send(mail: &MailConfig, path: &Path) -> Result<()> {
+    deliver(mail, &build_message(mail, path, None)?).map(|_| ())
+}
+fn build_message(mail: &MailConfig, path: &Path, test_subject: Option<&str>) -> Result<Message> {
     let content = fs::read(path).map_err(|_| "attachment unavailable")?;
     let message = Message::builder()
         .from(mail.sender.parse().map_err(|_| "invalid sender")?)
         .to(mail.recipient.parse().map_err(|_| "invalid recipient")?)
-        .subject(format!(
-            "{} screenshots",
-            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into())
-        ))
+        .subject(test_subject.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "{} screenshots",
+                std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into())
+            )
+        }))
         .multipart(
             MultiPart::mixed()
                 .singlepart(SinglePart::plain(
-                    "GoodGoodStudy screenshot batch.".to_string(),
+                    if test_subject.is_some() {
+                        "GoodGoodStudy SMTP test with a synthetic attachment."
+                    } else {
+                        "GoodGoodStudy screenshot batch."
+                    }
+                    .to_string(),
                 ))
                 .singlepart(
                     Attachment::new(
@@ -189,7 +199,15 @@ fn send(mail: &MailConfig, path: &Path) -> Result<()> {
                 ),
         )
         .map_err(|_| "message build failed")?;
-    let transport = SmtpTransport::starttls_relay(&mail.host)
+    Ok(message)
+}
+fn deliver(mail: &MailConfig, message: &Message) -> Result<String> {
+    let builder = if matches!(mail.port, 465 | 994) {
+        SmtpTransport::relay(&mail.host)
+    } else {
+        SmtpTransport::starttls_relay(&mail.host)
+    };
+    let transport = builder
         .map_err(|_| "SMTP TLS unavailable")?
         .port(mail.port)
         .credentials(Credentials::new(
@@ -198,8 +216,29 @@ fn send(mail: &MailConfig, path: &Path) -> Result<()> {
         ))
         .timeout(Some(Duration::from_secs(15)))
         .build();
-    transport.send(&message).map_err(|_| "mail send failed")?;
-    Ok(())
+    let response = transport.send(message).map_err(|error| {
+        eprintln!(
+            "SMTP failure: transient={}, permanent={}, timeout={}, tls={}, status={}",
+            error.is_transient(),
+            error.is_permanent(),
+            error.is_timeout(),
+            error.is_tls(),
+            error
+                .status()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".into())
+        );
+        if error.is_tls() {
+            "SMTP TLS handshake failed"
+        } else if error.is_timeout() {
+            "SMTP operation timed out"
+        } else if error.status().is_some_and(|code| code.to_string() == "535") {
+            "SMTP authentication rejected"
+        } else {
+            "mail send failed"
+        }
+    })?;
+    Ok(response.code().to_string())
 }
 fn sender(config: Arc<Config>, queue: PathBuf, root: PathBuf, stop: StopEvent) {
     let mut retry = 5u32;
@@ -217,7 +256,8 @@ fn sender(config: Arc<Config>, queue: PathBuf, root: PathBuf, stop: StopEvent) {
                     log(&root, "Oversize archive retained; 10 MiB limit.");
                     continue;
                 }
-                if send(&config.mail, &path).is_err() {
+                if let Err(error) = send(&config.mail, &path) {
+                    log(&root, error);
                     log(&root, "Mail failed; archive retained.");
                     failed = true;
                     break;
@@ -328,6 +368,10 @@ pub fn run(address: &str, root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "mail_tests.rs"]
+mod mail_tests;
 
 #[cfg(test)]
 mod tests {

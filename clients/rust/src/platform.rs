@@ -274,6 +274,12 @@ impl Drop for EventInner {
 }
 #[derive(Clone)]
 pub struct StopEvent(Arc<EventInner>);
+#[cfg(test)]
+pub(crate) fn test_stop_event() -> StopEvent {
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    assert!(!event.is_null());
+    StopEvent(Arc::new(EventInner(event)))
+}
 impl StopEvent {
     pub fn wait(&self, milliseconds: u32) -> bool {
         unsafe { WaitForSingleObject(self.0 .0, milliseconds) != 258 }

@@ -3,7 +3,7 @@ param(
  [ValidateRange(1,30)][int]$Attempts=20
 )
 $ErrorActionPreference='Stop'
-$build=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.1'
+$build=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GoodGoodStudyBuilds\3.2.2'
 $base=Join-Path $build ('stability-tests\'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
 [IO.Directory]::CreateDirectory($base)|Out-Null
 $results=@()
