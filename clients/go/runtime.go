@@ -72,20 +72,106 @@ func stored(dirs ...string) int64 {
 	}
 	return total
 }
+
+// maxAttachmentBytes is the largest archive the sender will attach.
+const maxAttachmentBytes = 10 * 1024 * 1024
+
+// maxBatchSourceBytes leaves headroom for ZIP overhead; PNGs barely compress.
+const maxBatchSourceBytes = 9 * 1024 * 1024
+
+// oversizeSuffix marks archives that can never be mailed; kept until pruned.
+const oversizeSuffix = ".oversize"
+
+// prune applies retention and the storage limit to captures and the mail
+// queue. Expired files go first; if still at or above limit, the oldest
+// managed files (time-ordered ggs- names) are removed until it fits, so unsent
+// batches are dropped oldest-first instead of pausing capture indefinitely.
 func prune(directory string, days int, limit int64, queue string) {
-	list, _ := images(directory, ".png")
-	for _, path := range list {
-		if f, e := os.Stat(path); e == nil && f.ModTime().Before(time.Now().Add(-time.Duration(days)*24*time.Hour)) {
-			os.Remove(path)
+	type managed struct {
+		name, path string
+		size       int64
+	}
+	var list []managed
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	for _, dir := range []string{directory, queue} {
+		entries, _ := os.ReadDir(dir)
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasPrefix(name, "ggs-") || strings.HasSuffix(name, ".tmp") {
+				continue
+			}
+			info, e := entry.Info()
+			if e != nil {
+				continue
+			}
+			path := filepath.Join(dir, name)
+			if info.ModTime().Before(cutoff) {
+				os.Remove(path)
+				continue
+			}
+			list = append(list, managed{name, path, info.Size()})
 		}
 	}
-	list, _ = images(directory, ".png")
-	for _, path := range list {
-		if stored(directory, queue) < limit {
+	total := stored(directory, queue)
+	if total < limit {
+		return
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].name < list[j].name })
+	for _, m := range list {
+		if total < limit {
 			break
 		}
-		os.Remove(path)
+		if os.Remove(m.path) == nil {
+			total -= m.size
+		}
 	}
+}
+
+// nextBatch reports how many leading files form the next batch (0 = wait).
+// A batch closes at batchSize files or before the next file would push the
+// source total past maxBytes; one oversized file forms its own batch.
+func nextBatch(sizes []int64, batchSize int, maxBytes int64) int {
+	var total int64
+	for i, size := range sizes {
+		if i > 0 && total+size > maxBytes {
+			return i
+		}
+		total += size
+		if i+1 >= batchSize || total >= maxBytes {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// archiveReady archives every complete batch currently waiting.
+func archiveReady(directory, queue string, batchSize int, root string) {
+	for {
+		list, e := images(directory, ".png")
+		if e != nil {
+			return
+		}
+		sizes := make([]int64, len(list))
+		for i, p := range list {
+			if f, err := os.Stat(p); err == nil {
+				sizes[i] = f.Size()
+			}
+		}
+		n := nextBatch(sizes, batchSize, maxBatchSourceBytes)
+		if n == 0 {
+			return
+		}
+		if _, e = archiveBatch(queue, list[:n]); e != nil {
+			logLine(root, "Archive failed: "+e.Error()+"; recoverable files retained.")
+			return
+		}
+	}
+}
+
+// quarantine moves an unsendable archive out of the mail queue.
+func quarantine(path string) (string, error) {
+	target := path + oversizeSuffix
+	return target, os.Rename(path, target)
 }
 func capture(directory string) error {
 	img, e := captureImage()
@@ -170,23 +256,56 @@ func archiveBatch(queue string, files []string) (string, error) {
 	}
 	return final, nil
 }
+
+// smtpIdleTimeout bounds each network read/write rather than the whole
+// session, so a 10 MiB attachment on a slow uplink is not cut off at 15 s.
+const smtpIdleTimeout = 30 * time.Second
+
+// idleConn refreshes the deadline before every read and write.
+type idleConn struct{ net.Conn }
+
+func (c idleConn) Read(b []byte) (int, error) {
+	c.Conn.SetDeadline(time.Now().Add(smtpIdleTimeout))
+	return c.Conn.Read(b)
+}
+func (c idleConn) Write(b []byte) (int, error) {
+	c.Conn.SetDeadline(time.Now().Add(smtpIdleTimeout))
+	return c.Conn.Write(b)
+}
+
+// implicitTLS reports whether the port expects TLS from the first byte
+// (SMTPS 465, IMAP-style 994 used by some providers) instead of STARTTLS.
+func implicitTLS(port int) bool { return port == 465 || port == 994 }
+
 func sendArchive(c MailConfig, path string) error {
-	connection, e := net.DialTimeout("tcp", net.JoinHostPort(c.Host, fmt.Sprint(c.Port)), 15*time.Second)
+	tlsConfig := &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}
+	address := net.JoinHostPort(c.Host, fmt.Sprint(c.Port))
+	raw, e := net.DialTimeout("tcp", address, 15*time.Second)
 	if e != nil {
 		return e
 	}
+	var connection net.Conn = idleConn{raw}
+	if implicitTLS(c.Port) {
+		secure := tls.Client(connection, tlsConfig)
+		if e = secure.Handshake(); e != nil {
+			raw.Close()
+			return e
+		}
+		connection = secure
+	}
 	defer connection.Close()
-	connection.SetDeadline(time.Now().Add(15 * time.Second))
 	client, e := smtp.NewClient(connection, c.Host)
 	if e != nil {
 		return e
 	}
 	defer client.Close()
-	if ok, _ := client.Extension("STARTTLS"); !ok {
-		return errors.New("SMTP STARTTLS required")
-	}
-	if e = client.StartTLS(&tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}); e != nil {
-		return e
+	if !implicitTLS(c.Port) {
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return errors.New("SMTP STARTTLS required")
+		}
+		if e = client.StartTLS(tlsConfig); e != nil {
+			return e
+		}
 	}
 	if e = client.Auth(smtp.PlainAuth("", c.Username, c.Password, c.Host)); e != nil {
 		return e
@@ -250,16 +369,21 @@ func sender(c Config, queue, root string, g *guard, wg *sync.WaitGroup) {
 			if e != nil {
 				continue
 			}
-			if f.Size() > 10*1024*1024 {
-				logLine(root, "Oversize archive retained; 10 MiB limit.")
+			if f.Size() > maxAttachmentBytes {
+				if _, e := quarantine(path); e != nil {
+					logLine(root, "Oversize archive could not be moved aside: "+e.Error())
+					failed = true
+					break
+				}
+				logLine(root, "Oversize archive moved aside (*.zip.oversize); 10 MiB mail limit.")
 				continue
 			}
-			if sendArchive(c.Mail, path) != nil {
-				logLine(root, "Mail failed; archive retained.")
+			if e := sendArchive(c.Mail, path); e != nil {
+				logLine(root, "Mail failed: "+e.Error()+"; archive retained.")
 				failed = true
 				break
 			}
-			if os.Remove(path) != nil {
+			if e := os.Remove(path); e != nil && !os.IsNotExist(e) {
 				logLine(root, "Sent archive could not be removed; delivery may repeat.")
 				failed = true
 				break
@@ -329,23 +453,16 @@ func runApp(address, root string) error {
 			return nil
 		}
 		limit := int64(c.Storage) * 1024 * 1024
-		if !c.Mail.Enabled {
-			prune(directory, c.Retention, limit, queue)
-		}
+		prune(directory, c.Retention, limit, queue)
 		if stored(directory, queue) < limit {
-			if capture(directory) != nil {
-				logLine(root, "Capture failed; retry at next interval.")
+			if e := capture(directory); e != nil {
+				logLine(root, "Capture failed: "+e.Error()+"; retry at next interval.")
 			}
 		} else {
-			logLine(root, "Storage limit reached; capture paused.")
+			logLine(root, "Storage limit reached; capture skipped.")
 		}
 		if c.Mail.Enabled {
-			list, err := images(directory, ".png")
-			if err == nil && len(list) >= c.Batch {
-				if _, e := archiveBatch(queue, list[:c.Batch]); e != nil {
-					logLine(root, "Archive failed; recoverable files retained.")
-				}
-			}
+			archiveReady(directory, queue, c.Batch, root)
 		}
 		next = next.Add(interval)
 		if next.Before(time.Now()) {

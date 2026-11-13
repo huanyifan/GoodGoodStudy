@@ -18,6 +18,12 @@ use std::{
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 static LOG_GATE: Mutex<()> = Mutex::new(());
+/// Largest archive the sender will attach (before base64 expansion).
+pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+/// Source bytes per batch; PNGs barely compress, so leave room for ZIP overhead.
+pub const MAX_BATCH_SOURCE_BYTES: u64 = 9 * 1024 * 1024;
+/// Suffix for archives that can never be mailed; kept until retention pruning.
+const OVERSIZE_SUFFIX: &str = ".oversize";
 pub fn log(root: &Path, message: &str) {
     let Ok(_lock) = LOG_GATE.lock() else { return };
     let path = root.join("runtime.log");
@@ -81,28 +87,103 @@ fn stored(directories: &[&Path]) -> u64 {
         .map(|m| m.len())
         .sum()
 }
+/// Apply retention and the storage limit to captures *and* the mail queue.
+///
+/// Files older than `days` are removed first. If the total is still at or above
+/// `limit`, the oldest managed files (by their time-ordered `ggs-` names) are
+/// removed until it fits. Unsent batches are therefore dropped oldest-first
+/// instead of pausing capture forever while mail is unavailable.
 fn prune(directory: &Path, queue: &Path, days: u32, limit: u64) {
-    if let Ok(list) = files(directory, ".png") {
-        for path in list {
-            let old = fs::metadata(&path)
-                .and_then(|m| m.modified())
+    let max_age = Duration::from_secs(days as u64 * 86400);
+    let mut managed = Vec::new();
+    for dir in [directory, queue] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("ggs-") || name.ends_with(".tmp") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let expired = metadata
+                .modified()
                 .ok()
                 .and_then(|m| m.elapsed().ok())
-                .map(|age| age > Duration::from_secs(days as u64 * 86400))
-                .unwrap_or(false);
-            if old {
-                let _ = fs::remove_file(path);
+                .is_some_and(|age| age > max_age);
+            if expired {
+                let _ = fs::remove_file(entry.path());
+            } else {
+                managed.push((name, entry.path(), metadata.len()));
             }
         }
     }
-    if let Ok(list) = files(directory, ".png") {
-        for path in list {
-            if stored(&[directory, queue]) < limit {
-                break;
-            }
-            let _ = fs::remove_file(path);
+    let mut total = stored(&[directory, queue]);
+    if total < limit {
+        return;
+    }
+    managed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, path, len) in managed {
+        if total < limit {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(len);
         }
     }
+}
+/// How many leading files form the next batch, or `None` to keep waiting.
+///
+/// A batch closes at `batch_size` files or before the next file would push the
+/// source total past `max_bytes`. A single file larger than `max_bytes` forms
+/// its own batch so it cannot block the queue.
+fn next_batch(sizes: &[u64], batch_size: usize, max_bytes: u64) -> Option<usize> {
+    let mut total = 0u64;
+    for (index, &size) in sizes.iter().enumerate() {
+        if index > 0 && total.saturating_add(size) > max_bytes {
+            return Some(index);
+        }
+        total = total.saturating_add(size);
+        if index + 1 >= batch_size || total >= max_bytes {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+/// Archive every complete batch currently waiting in `directory`.
+fn archive_ready(directory: &Path, queue: &Path, batch_size: usize, root: &Path) {
+    loop {
+        let Ok(list) = files(directory, ".png") else {
+            return;
+        };
+        let sizes: Vec<u64> = list
+            .iter()
+            .map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .collect();
+        let Some(count) = next_batch(&sizes, batch_size, MAX_BATCH_SOURCE_BYTES) else {
+            return;
+        };
+        if let Err(error) = archive(queue, &list[..count]) {
+            log(
+                root,
+                &format!("Archive failed: {error}; recoverable files retained."),
+            );
+            return;
+        }
+    }
+}
+/// Move an unsendable archive out of the mail queue (it stays subject to pruning).
+fn quarantine(path: &Path) -> Result<PathBuf> {
+    let mut target = path.as_os_str().to_owned();
+    target.push(OVERSIZE_SUFFIX);
+    let target = PathBuf::from(target);
+    fs::rename(path, &target).map_err(|_| "oversize archive could not be moved aside")?;
+    Ok(target)
 }
 struct Temporary(PathBuf);
 impl Drop for Temporary {
@@ -252,8 +333,18 @@ fn sender(config: Arc<Config>, queue: PathBuf, root: PathBuf, stop: StopEvent) {
                 let Ok(metadata) = fs::metadata(&path) else {
                     continue;
                 };
-                if metadata.len() > 10 * 1024 * 1024 {
-                    log(&root, "Oversize archive retained; 10 MiB limit.");
+                if metadata.len() > MAX_ATTACHMENT_BYTES {
+                    match quarantine(&path) {
+                        Ok(_) => log(
+                            &root,
+                            "Oversize archive moved aside (*.zip.oversize); 10 MiB mail limit.",
+                        ),
+                        Err(error) => {
+                            log(&root, error);
+                            failed = true;
+                            break;
+                        }
+                    }
                     continue;
                 }
                 if let Err(error) = send(&config.mail, &path) {
@@ -262,7 +353,7 @@ fn sender(config: Arc<Config>, queue: PathBuf, root: PathBuf, stop: StopEvent) {
                     failed = true;
                     break;
                 }
-                if fs::remove_file(&path).is_err() {
+                if fs::remove_file(&path).is_err() && path.exists() {
                     log(
                         &root,
                         "Sent archive could not be removed; delivery may repeat.",
@@ -338,24 +429,19 @@ pub fn run(address: &str, root: &Path) -> Result<()> {
             break;
         }
         let limit = config.max_storage_mb as u64 * 1024 * 1024;
-        if !config.mail.enabled {
-            prune(&directory, &queue, config.retention_days, limit)
-        }
+        prune(&directory, &queue, config.retention_days, limit);
         if stored(&[&directory, &queue]) < limit {
-            if capture(&directory).is_err() {
-                log(root, "Capture failed; retry at next interval.");
+            if let Err(error) = capture(&directory) {
+                log(
+                    root,
+                    &format!("Capture failed: {error}; retry at next interval."),
+                );
             }
         } else {
-            log(root, "Storage limit reached; capture paused.");
+            log(root, "Storage limit reached; capture skipped.");
         }
         if config.mail.enabled {
-            if let Ok(list) = files(&directory, ".png") {
-                if list.len() >= config.batch_size
-                    && archive(&queue, &list[..config.batch_size]).is_err()
-                {
-                    log(root, "Archive failed; recoverable files retained.");
-                }
-            }
+            archive_ready(&directory, &queue, config.batch_size, root);
         }
         next += interval;
         if next < Instant::now() {
@@ -401,6 +487,61 @@ mod tests {
         assert!(keep.exists());
         // A freshly created test-only directory, never a configured screenshot path.
         assert!(root.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn batches_close_on_count_or_size() {
+        const M: u64 = 1024 * 1024;
+        // Waits while under both the count and the size limits.
+        assert_eq!(next_batch(&[], 10, 9 * M), None);
+        assert_eq!(next_batch(&[M; 9], 10, 9 * M + 1), None);
+        // Count limit.
+        assert_eq!(next_batch(&[M; 12], 10, 100 * M), Some(10));
+        // Size limit: stop before the file that would overflow.
+        assert_eq!(next_batch(&[4 * M, 4 * M, 4 * M], 10, 9 * M), Some(2));
+        // Exactly reaching the limit closes the batch.
+        assert_eq!(next_batch(&[3 * M, 3 * M, 3 * M, M], 10, 9 * M), Some(3));
+        // One huge file is sent alone instead of blocking forever.
+        assert_eq!(next_batch(&[20 * M, M], 10, 9 * M), Some(1));
+    }
+    #[test]
+    fn prune_covers_queue_and_drops_oldest_first() {
+        let root = std::env::temp_dir().join(format!("ggs-rust-prune-{}", uuid::Uuid::new_v4()));
+        let captures = root.join("captures");
+        let queue = root.join("pending");
+        fs::create_dir_all(&captures).unwrap();
+        fs::create_dir_all(&queue).unwrap();
+        // Names are time-ordered: zip (oldest) < png < png (newest).
+        let old_zip = queue.join("ggs-00000000000000000001-a.zip");
+        let oversize = queue.join("ggs-00000000000000000002-b.zip.oversize");
+        let mid_png = captures.join("ggs-00000000000000000003-c.png");
+        let new_png = captures.join("ggs-00000000000000000004-d.png");
+        let foreign = captures.join("keep-me.txt");
+        for path in [&old_zip, &oversize, &mid_png, &new_png] {
+            fs::write(path, vec![0u8; 1000]).unwrap();
+        }
+        fs::write(&foreign, b"x").unwrap();
+        // Under the limit: nothing is removed.
+        prune(&captures, &queue, 7, 1_000_000);
+        assert!(old_zip.exists() && new_png.exists());
+        // Limit of 2500 bytes: the two oldest managed files go, newest stay.
+        prune(&captures, &queue, 7, 2500);
+        assert!(!old_zip.exists());
+        assert!(!oversize.exists());
+        assert!(mid_png.exists() && new_png.exists());
+        assert!(foreign.exists(), "unmanaged files are never deleted");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn oversize_archive_leaves_mail_queue() {
+        let root = std::env::temp_dir().join(format!("ggs-rust-oversize-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let zip = root.join(unique("zip"));
+        fs::write(&zip, b"zip").unwrap();
+        let moved = quarantine(&zip).unwrap();
+        assert!(!zip.exists() && moved.exists());
+        assert!(moved.to_string_lossy().ends_with(".zip.oversize"));
+        assert!(files(&root, ".zip").unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }

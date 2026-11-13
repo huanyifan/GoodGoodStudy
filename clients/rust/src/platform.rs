@@ -10,6 +10,31 @@ use std::{
 };
 use zeroize::Zeroize;
 type Handle = *mut c_void;
+
+// Win32 constants (named instead of inline literals).
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_ABANDONED: u32 = 0x80;
+const WAIT_TIMEOUT: u32 = 258;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+const SYNCHRONIZE_AND_MUTEX_MODIFY_STATE: u32 = 0x0010_0000 | 0x0001;
+const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_USER_CLASS: u32 = 1;
+const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+const SDDL_REVISION_1: u32 = 1;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const CREATE_NEW: u32 = 1;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+const SM_XVIRTUALSCREEN: i32 = 76;
+const SM_YVIRTUALSCREEN: i32 = 77;
+const SM_CXVIRTUALSCREEN: i32 = 78;
+const SM_CYVIRTUALSCREEN: i32 = 79;
+const SRCCOPY: u32 = 0x00CC_0020;
+const CAPTUREBLT: u32 = 0x4000_0000;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 #[repr(C)]
 struct Blob {
     len: u32,
@@ -49,6 +74,8 @@ extern "system" {
         template: Handle,
     ) -> Handle;
     fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    fn GetModuleHandleW(name: *const u16) -> Handle;
+    fn GetProcAddress(module: Handle, name: *const std::ffi::c_char) -> *mut c_void;
 }
 #[link(name = "advapi32")]
 extern "system" {
@@ -105,25 +132,26 @@ pub fn stop_existing(timeout_ms: u32) -> Result<()> {
     let event_name = text(&format!("Local\\GoodGoodStudyStop-{}", id));
     let mutex_name = text(&format!("Local\\GoodGoodStudy-{}", id));
     unsafe {
-        let event = OpenEventW(2, 0, event_name.as_ptr());
+        let event = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
         if !event.is_null() {
             SetEvent(event);
             CloseHandle(event);
         }
-        let mutex = OpenMutexW(0x00100001, 0, mutex_name.as_ptr());
+        let mutex = OpenMutexW(SYNCHRONIZE_AND_MUTEX_MODIFY_STATE, 0, mutex_name.as_ptr());
         if mutex.is_null() {
-            return if GetLastError() == 2 {
+            return if GetLastError() == ERROR_FILE_NOT_FOUND {
                 Ok(())
             } else {
                 Err("existing instance status unavailable")
             };
         }
         let result = WaitForSingleObject(mutex, timeout_ms);
-        if result == 0 || result == 0x80 {
+        let acquired = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+        if acquired {
             ReleaseMutex(mutex);
         }
         CloseHandle(mutex);
-        if result == 0 || result == 0x80 {
+        if acquired {
             Ok(())
         } else {
             Err("existing instance has not stopped")
@@ -133,18 +161,23 @@ pub fn stop_existing(timeout_ms: u32) -> Result<()> {
 pub fn sid() -> Result<String> {
     unsafe {
         let mut token = ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), 8, &mut token) == 0 {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return Err("token unavailable");
         }
         let mut length = 0;
-        GetTokenInformation(token, 1, ptr::null_mut(), 0, &mut length);
+        GetTokenInformation(token, TOKEN_USER_CLASS, ptr::null_mut(), 0, &mut length);
         if length == 0 {
             CloseHandle(token);
             return Err("token unavailable");
         }
         let mut buffer = vec![0u8; length as usize];
-        let success =
-            GetTokenInformation(token, 1, buffer.as_mut_ptr().cast(), length, &mut length);
+        let success = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buffer.as_mut_ptr().cast(),
+            length,
+            &mut length,
+        );
         CloseHandle(token);
         if success == 0 {
             return Err("token unavailable");
@@ -185,7 +218,7 @@ pub fn dpapi(data: &[u8], decrypt: bool) -> Result<Vec<u8>> {
                 &entropy,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                1,
+                CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output,
             )
         } else {
@@ -195,7 +228,7 @@ pub fn dpapi(data: &[u8], decrypt: bool) -> Result<Vec<u8>> {
                 &entropy,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                1,
+                CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output,
             )
         };
@@ -218,7 +251,7 @@ pub fn private_write(path: &Path, data: &[u8]) -> Result<()> {
     unsafe {
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
-            1,
+            SDDL_REVISION_1,
             &mut descriptor,
             ptr::null_mut(),
         ) == 0
@@ -233,11 +266,11 @@ pub fn private_write(path: &Path, data: &[u8]) -> Result<()> {
         let name = wide(path.as_os_str());
         let handle = CreateFileW(
             name.as_ptr(),
-            0x40000000,
+            GENERIC_WRITE,
             0,
             &attributes,
-            1,
-            0x80,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
         );
         LocalFree(descriptor);
@@ -255,7 +288,13 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     private_write(&temporary, data)?;
     let from = wide(temporary.as_os_str());
     let to = wide(path.as_os_str());
-    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) };
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
     if ok == 0 {
         let _ = fs::remove_file(temporary);
         return Err("atomic replacement failed");
@@ -282,7 +321,7 @@ pub(crate) fn test_stop_event() -> StopEvent {
 }
 impl StopEvent {
     pub fn wait(&self, milliseconds: u32) -> bool {
-        unsafe { WaitForSingleObject(self.0 .0, milliseconds) != 258 }
+        unsafe { WaitForSingleObject(self.0 .0, milliseconds) != WAIT_TIMEOUT }
     }
     pub fn signal(&self) {
         unsafe {
@@ -303,7 +342,7 @@ impl Guard {
             if mutex.is_null() {
                 return Err("mutex unavailable");
             }
-            if GetLastError() == 183 {
+            if GetLastError() == ERROR_ALREADY_EXISTS {
                 CloseHandle(mutex);
                 return Err("already running");
             }
@@ -413,11 +452,34 @@ impl Drop for Bitmap {
         }
     }
 }
-pub fn screenshot() -> Result<(u32, u32, Vec<u8>)> {
-    unsafe {
+/// Opt into per-monitor DPI awareness once, so mixed-DPI multi-monitor
+/// desktops are captured at physical resolution. Falls back to the legacy
+/// system-DPI API on Windows builds without SetProcessDpiAwarenessContext.
+fn enable_dpi_awareness() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let module = GetModuleHandleW(text("user32.dll").as_ptr());
+        if !module.is_null() {
+            let proc = GetProcAddress(module, c"SetProcessDpiAwarenessContext".as_ptr());
+            if !proc.is_null() {
+                let set: extern "system" fn(isize) -> i32 = std::mem::transmute(proc);
+                if set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0 {
+                    return;
+                }
+            }
+        }
         SetProcessDPIAware();
-        let width = GetSystemMetrics(0);
-        let height = GetSystemMetrics(1);
+    });
+}
+
+/// Capture the whole virtual desktop (every attached monitor) as RGBA.
+pub fn screenshot() -> Result<(u32, u32, Vec<u8>)> {
+    enable_dpi_awareness();
+    unsafe {
+        let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         if width <= 0
             || height <= 0
             || width > 16384
@@ -472,9 +534,9 @@ pub fn screenshot() -> Result<(u32, u32, Vec<u8>)> {
             width,
             height,
             source.0,
-            0,
-            0,
-            0x00CC0020 | 0x40000000,
+            left,
+            top,
+            SRCCOPY | CAPTUREBLT,
         ) == 0
         {
             return Err("screen copy failed");

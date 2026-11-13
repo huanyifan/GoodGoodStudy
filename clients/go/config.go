@@ -67,7 +67,7 @@ func decodeConfig(b []byte) (Config, error) {
 	if c.Mail.Enabled {
 		from, e1 := mail.ParseAddress(c.Mail.Sender)
 		to, e2 := mail.ParseAddress(c.Mail.Recipient)
-		if e1 != nil || e2 != nil || c.Mail.Host == "" || c.Mail.Port < 1 || c.Mail.Port > 65535 || !c.Mail.TLS || c.Mail.Port == 465 || c.Mail.Username == "" || c.Mail.Password == "" {
+		if e1 != nil || e2 != nil || c.Mail.Host == "" || c.Mail.Port < 1 || c.Mail.Port > 65535 || !c.Mail.TLS || c.Mail.Username == "" || c.Mail.Password == "" {
 			return c, invalid
 		}
 		c.Mail.Sender = from.Address
@@ -283,7 +283,15 @@ func parseINI(data string) (Config, error) {
 	if e != nil || minutes < 1 || minutes > 1440 {
 		return Config{}, invalid
 	}
-	c := Config{Interval: minutes * 60, Batch: 10, Retention: 7, Storage: 512, Mail: MailConfig{true, v["smtpServer"], 587, true, v["senderMail"], v["toMail"], v["senderMail"], v["tokenCode"]}}
+	port := 587
+	if p, ok := v["smtpPort"]; ok {
+		if port, e = strconv.Atoi(p); e != nil {
+			return Config{}, invalid
+		}
+	} else if strings.EqualFold(v["smtpServer"], "smtp.163.com") {
+		port = 465
+	}
+	c := Config{Interval: minutes * 60, Batch: 10, Retention: 7, Storage: 512, Mail: MailConfig{true, v["smtpServer"], port, true, v["senderMail"], v["toMail"], v["senderMail"], v["tokenCode"]}}
 	b, _ := json.Marshal(c)
 	defer clear(b)
 	return decodeConfig(b)

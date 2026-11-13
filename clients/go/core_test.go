@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -205,5 +206,82 @@ func TestINIConversion(t *testing.T) {
 	b, _ := json.Marshal(c)
 	if bytes.Contains(b, []byte("sessionKey")) {
 		t.Fatal("unexpected key field")
+	}
+}
+func TestNextBatch(t *testing.T) {
+	const m = 1024 * 1024
+	cases := []struct {
+		sizes []int64
+		batch int
+		max   int64
+		want  int
+	}{
+		{nil, 10, 9 * m, 0},
+		{[]int64{m, m, m}, 10, 9 * m, 0},
+		{[]int64{m, m, m, m, m, m, m, m, m, m, m, m}, 10, 100 * m, 10},
+		{[]int64{4 * m, 4 * m, 4 * m}, 10, 9 * m, 2},
+		{[]int64{3 * m, 3 * m, 3 * m, m}, 10, 9 * m, 3},
+		{[]int64{20 * m, m}, 10, 9 * m, 1},
+	}
+	for _, c := range cases {
+		if got := nextBatch(c.sizes, c.batch, c.max); got != c.want {
+			t.Fatalf("nextBatch(%v) = %d, want %d", c.sizes, got, c.want)
+		}
+	}
+}
+func TestPruneCoversQueue(t *testing.T) {
+	root := t.TempDir()
+	captures, queue := filepath.Join(root, "captures"), filepath.Join(root, "pending")
+	os.Mkdir(captures, 0700)
+	os.Mkdir(queue, 0700)
+	oldZip := filepath.Join(queue, "ggs-20200101T000000.000000001Z-a.zip")
+	oversize := filepath.Join(queue, "ggs-20200101T000000.000000002Z-b.zip.oversize")
+	midPNG := filepath.Join(captures, "ggs-20200101T000000.000000003Z-c.png")
+	newPNG := filepath.Join(captures, "ggs-20200101T000000.000000004Z-d.png")
+	foreign := filepath.Join(captures, "keep-me.txt")
+	for _, p := range []string{oldZip, oversize, midPNG, newPNG} {
+		os.WriteFile(p, make([]byte, 1000), 0600)
+	}
+	os.WriteFile(foreign, []byte("x"), 0600)
+	prune(captures, 7, 1000000, queue)
+	if _, e := os.Stat(oldZip); e != nil {
+		t.Fatal("pruned while under limit")
+	}
+	prune(captures, 7, 2500, queue)
+	for _, p := range []string{oldZip, oversize} {
+		if _, e := os.Stat(p); !os.IsNotExist(e) {
+			t.Fatal("oldest file kept", p)
+		}
+	}
+	for _, p := range []string{midPNG, newPNG, foreign} {
+		if _, e := os.Stat(p); e != nil {
+			t.Fatal("newer or unmanaged file removed", p)
+		}
+	}
+}
+func TestQuarantine(t *testing.T) {
+	root := t.TempDir()
+	zip := filepath.Join(root, unique(".zip"))
+	os.WriteFile(zip, []byte("zip"), 0600)
+	if _, e := quarantine(zip); e != nil {
+		t.Fatal(e)
+	}
+	if list, _ := images(root, ".zip"); len(list) != 0 {
+		t.Fatal("oversize archive still queued")
+	}
+}
+func TestSMTPPorts(t *testing.T) {
+	for _, port := range []int{465, 994, 587} {
+		data := fmt.Sprintf(`{"mail":{"enabled":true,"host":"smtp.example.test","port":%d,"enableSsl":true,"sender":"sender@example.test","recipient":"recipient@example.test","username":"synthetic-user","password":"synthetic-only"}}`, port)
+		if c, e := decodeConfig([]byte(data)); e != nil || c.Mail.Port != port {
+			t.Fatal("secure SMTP port rejected", port, e)
+		}
+	}
+	ini := "senderMail=sender@example.test\nsmtpServer=smtp.163.com\ntokenCode=synthetic-only\ntoMail=recipient@example.test\ntimeInterval=2"
+	if c, e := parseINI(ini); e != nil || c.Mail.Port != 465 {
+		t.Fatal("163 INI should use implicit TLS port 465", e)
+	}
+	if c, e := parseINI(ini + "\nsmtpPort=994"); e != nil || c.Mail.Port != 994 {
+		t.Fatal("explicit smtpPort ignored", e)
 	}
 }

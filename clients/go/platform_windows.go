@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -156,13 +157,49 @@ type bitmapInfo struct {
 	Colors [1]uint32
 }
 
+const (
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+	smCXVirtualScreen = 78
+	smCYVirtualScreen = 79
+	srcCopy           = 0x00CC0020
+	captureBlt        = 0x40000000
+	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the handle value (HANDLE)-4.
+	perMonitorAwareV2 = ^uintptr(3)
+)
+
+var dpiOnce sync.Once
+
+// enableDPIAwareness opts into per-monitor DPI awareness once so mixed-DPI
+// desktops are captured at physical resolution, falling back to the legacy
+// system-DPI call on Windows builds that lack SetProcessDpiAwarenessContext.
+func enableDPIAwareness() {
+	dpiOnce.Do(func() {
+		if p := user32.NewProc("SetProcessDpiAwarenessContext"); p.Find() == nil {
+			if ok, _, _ := p.Call(perMonitorAwareV2); ok != 0 {
+				return
+			}
+		}
+		user32.NewProc("SetProcessDPIAware").Call()
+	})
+}
+
+// signedMetric converts a GetSystemMetrics result; virtual-screen origins
+// are negative when a monitor sits left of or above the primary one.
+func signedMetric(index uintptr) int32 {
+	v, _, _ := metric.Call(index)
+	return int32(v)
+}
+
+// captureImage captures the whole virtual desktop (every attached monitor).
 func captureImage() (*image.RGBA, error) {
-	user32.NewProc("SetProcessDPIAware").Call()
-	w, _, _ := metric.Call(0)
-	h, _, _ := metric.Call(1)
-	if w == 0 || h == 0 || w > 16384 || h > 16384 || uint64(w)*uint64(h) > 64000000 {
+	enableDPIAwareness()
+	left, top := signedMetric(smXVirtualScreen), signedMetric(smYVirtualScreen)
+	sw, sh := signedMetric(smCXVirtualScreen), signedMetric(smCYVirtualScreen)
+	if sw <= 0 || sh <= 0 || sw > 16384 || sh > 16384 || uint64(sw)*uint64(sh) > 64000000 {
 		return nil, errors.New("invalid screen bounds")
 	}
+	w, h := uintptr(sw), uintptr(sh)
 	source, _, _ := getDC.Call(0)
 	if source == 0 {
 		return nil, errors.New("screen DC unavailable")
@@ -185,7 +222,7 @@ func captureImage() (*image.RGBA, error) {
 		return nil, errors.New("bitmap selection failed")
 	}
 	defer selectObject.Call(dc, old)
-	ok, _, _ := bitblt.Call(dc, 0, 0, w, h, source, 0, 0, 0x00CC0020|0x40000000)
+	ok, _, _ := bitblt.Call(dc, 0, 0, w, h, source, uintptr(left), uintptr(top), srcCopy|captureBlt)
 	if ok == 0 {
 		return nil, errors.New("screen copy failed")
 	}

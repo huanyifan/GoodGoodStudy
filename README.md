@@ -131,7 +131,7 @@ handle /tools/goodgoodstudy/config.json {
 .\GoodGoodStudy.exe --convert-ini C:\private\config.ini C:\private\server-config.private.json
 ~~~
 
-转换结果是仅当前用户可读的服务端私有明文配置，不是可公开上传的静态文件；只部署到上述私有目录。旧 timeInterval 按分钟转换为秒，每批 10 张。Rust 3.2.2 支持 465/994 隐式 TLS，其余端口要求 STARTTLS，均校验证书；关闭 TLS 的配置会被拒绝。163 邮箱 INI 默认转换为465，其他主机默认587，也可通过可选 smtpPort 字段明确指定。旧版 Rust、Go 和 VB.NET 对照实现不能直接沿用新的465配置。
+转换结果是仅当前用户可读的服务端私有明文配置，不是可公开上传的静态文件；只部署到上述私有目录。旧 timeInterval 按分钟转换为秒，每批 10 张。Rust 3.2.2 支持 465/994 隐式 TLS，其余端口要求 STARTTLS，均校验证书；关闭 TLS 的配置会被拒绝。163 邮箱 INI 默认转换为465，其他主机默认587，也可通过可选 smtpPort 字段明确指定。Go 对照实现同样支持 465/994 隐式 TLS；旧版 Rust、Go 和 VB.NET 不能直接沿用新的465配置。
 
 真实发信测试说明见 [邮件代码测试](docs/mail-test.md)。普通 cargo test 会跳过真实发信；只有显式运行对应 ignored 测试才发送一封标注主题、带合成文字 ZIP 的邮件。
 
@@ -140,16 +140,16 @@ handle /tools/goodgoodstudy/config.json {
 | 字段 | 默认值 | 含义 |
 |---|---|---|
 | intervalSeconds | 180 | 截图间隔，1–86400 秒，首次等待一个间隔 |
-| batchSize | 10 | 每批 1–100 张，仅邮件模式组包 |
+| batchSize | 10 | 每批最多 1–100 张，仅邮件模式组包；原图累计约 9 MiB 时提前成批 |
 | screenshotDirectory | 空 | 自动创建当前用户本地应用数据 captures 目录；自定义为绝对路径 |
-| retentionDays | 7 | 本地保存模式保留天数，1–365 |
-| maxStorageMB | 512 | 截图前检查的收集暂停阈值，16–8192 MiB，可能多出一张图片或当前归档临时空间 |
+| retentionDays | 7 | 截图与待发送 ZIP 的保留天数，1–365 |
+| maxStorageMB | 512 | 截图与待发送队列合计上限，16–8192 MiB；超出时从最旧的文件开始删除，可能多出一张图片或当前归档临时空间 |
 | mail.enabled | false | 是否发信 |
-| mail.host / port / enableSsl | 空 / 587 / true | SMTP STARTTLS，强制 TLS |
+| mail.host / port / enableSsl | 空 / 587 / true | 465/994 隐式 TLS，其余端口 STARTTLS，强制 TLS |
 | mail.sender / recipient | 空 | 各一个发件人与收件人地址 |
 | mail.username / password | 空 | SMTP 用户名与邮箱授权码 |
 
-截图仅主屏，采用唯一文件名；完整 ZIP 落盘后才移除原图。独立线程处理持久待发送队列，失败保留 ZIP 并在 5–300 秒间重试。发送成功后删除 ZIP。超过 10 MiB 的压缩附件保留并跳过，需手动处理；邮件编码还会增加体积。SMTP 在服务端已接收后若连接中断，重试可能产生重复邮件。
+截图覆盖全部显示器（整个虚拟桌面，按显示器 DPI 感知），采用唯一文件名；完整 ZIP 落盘后才移除原图。批次在达到 batchSize 张或原图累计约 9 MiB 时成包，单张超限的图片单独成包。独立线程处理持久待发送队列，失败保留 ZIP 并在 5–300 秒间重试。发送成功后删除 ZIP。仍超过 10 MiB 的压缩附件改名为 `*.zip.oversize` 移出发送队列，不再反复重试，之后按保留天数和容量上限清理；邮件编码还会增加体积。邮件长时间失败时不再暂停截图，而是按容量上限优先删除最旧的待发送批次。SMTP 在服务端已接收后若连接中断，重试可能产生重复邮件。
 
 邮件模式不自动删除未发送数据，达到容量阈值时暂停收集；本地保存模式按天数/容量清理。截图和 ZIP 是本地明文文件，不受配置会话加密保护。运行日志和守护日志位于 %LOCALAPPDATA%\GoodGoodStudy 并轮转。
 
