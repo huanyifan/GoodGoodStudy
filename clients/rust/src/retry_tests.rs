@@ -82,6 +82,11 @@ impl Drop for Fixture {
 #[test]
 #[ignore = "explicit integration run requires Python and cryptography; uses a private loopback TLS CA"]
 fn real_https_faults_recover_and_security_failures_do_not_retry() {
+    // The loopback fixture signs with the placeholder key in https_retry_fixture.py;
+    // trust it here instead of the real compiled production key.
+    const FIXTURE_SIGNING_PUB: &str =
+        "BB1aUS2J5pMwW4V7f7MuysLUoaI4XP8uAYi5uLqR0eSN69aM2DlHoWNqtfpTjWsIpaFAQSsb+ZAganwl66HbJXo=";
+    set_test_verifier(Some(verifying_key_from_b64(FIXTURE_SIGNING_PUB).unwrap()));
     let cases = [
         ("success", 1, true),
         ("502", 2, true),

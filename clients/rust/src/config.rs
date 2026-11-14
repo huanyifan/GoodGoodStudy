@@ -23,7 +23,7 @@ pub const RESPONSE_DOMAIN: &str = "GoodGoodStudy.Config.Response.v3";
 // configuration. Replace with the key from `config_admin --keygen-signing-key`
 // on the production server before building release binaries.
 pub const SERVER_SIGNING_KEY: &str =
-    "BB1aUS2J5pMwW4V7f7MuysLUoaI4XP8uAYi5uLqR0eSN69aM2DlHoWNqtfpTjWsIpaFAQSsb+ZAganwl66HbJXo=";
+    "BHy8nDFrMYAHKz6EhmD1tjvFdfT0+lNcR2Bx9KDhGf9QDxc6++SkbIvFdzcQv+P+0pZ8vramuiTsdjwkyqVZxmg=";
 
 fn transcript(domain: &str, device: &str, first: &[u8], second: &[u8], third: &[u8], fourth: &[u8], timestamp: i64) -> Vec<u8> {
     let mut message = format!("{domain}|{device}|").into_bytes();
@@ -40,7 +40,24 @@ pub fn verifying_key_from_b64(encoded: &str) -> Result<VerifyingKey> {
         .map_err(|_| "invalid server signing key")?;
     VerifyingKey::from_sec1_bytes(&raw).map_err(|_| "invalid server signing key")
 }
+#[cfg(test)]
+thread_local! {
+    static TEST_VERIFIER: std::cell::RefCell<Option<VerifyingKey>> =
+        const { std::cell::RefCell::new(None) };
+}
+// Test-only: lets the loopback integration fixture use its own signing key.
+// Never compiled into release builds, so production trusts only SERVER_SIGNING_KEY.
+#[cfg(test)]
+pub fn set_test_verifier(key: Option<VerifyingKey>) {
+    TEST_VERIFIER.with(|cell| *cell.borrow_mut() = key);
+}
 pub fn server_verifying_key() -> Result<VerifyingKey> {
+    #[cfg(test)]
+    {
+        if let Some(key) = TEST_VERIFIER.with(|cell| cell.borrow().clone()) {
+            return Ok(key);
+        }
+    }
     verifying_key_from_b64(SERVER_SIGNING_KEY)
 }
 

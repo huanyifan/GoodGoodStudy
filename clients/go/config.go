@@ -39,7 +39,7 @@ const maxClockSkew = 300
 // cannot forge configuration even when TLS is terminated by an interceptor.
 // Replace this with the public key printed by `config_admin --keygen-signing-key`
 // on the production server before building release binaries.
-var serverSigningKey = "BB1aUS2J5pMwW4V7f7MuysLUoaI4XP8uAYi5uLqR0eSN69aM2DlHoWNqtfpTjWsIpaFAQSsb+ZAganwl66HbJXo="
+var serverSigningKey = "BHy8nDFrMYAHKz6EhmD1tjvFdfT0+lNcR2Bx9KDhGf9QDxc6++SkbIvFdzcQv+P+0pZ8vramuiTsdjwkyqVZxmg="
 
 var invalid = errors.New("configuration or device credential invalid")
 
