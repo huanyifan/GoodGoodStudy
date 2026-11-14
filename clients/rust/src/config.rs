@@ -54,7 +54,7 @@ pub fn set_test_verifier(key: Option<VerifyingKey>) {
 pub fn server_verifying_key() -> Result<VerifyingKey> {
     #[cfg(test)]
     {
-        if let Some(key) = TEST_VERIFIER.with(|cell| cell.borrow().clone()) {
+        if let Some(key) = TEST_VERIFIER.with(|cell| *cell.borrow()) {
             return Ok(key);
         }
     }
