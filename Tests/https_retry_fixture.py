@@ -22,10 +22,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
 from config_server import make_response
 
 
+# Matches the clients' compiled SERVER_SIGNING_KEY placeholder; update both together
+# if the production signing key is rotated and this manual test is re-run.
+SIGNING_SCALAR = "kHrrVLd63F5r4S4a/FvqAz5JvtWg5KQGMV4wmE5ckO0="
+
+
 def main():
     mode = sys.argv[1]
     profile = json.loads(sys.stdin.readline())
     requests = []
+    signing_key = ec.derive_private_key(
+        int.from_bytes(base64.b64decode(SIGNING_SCALAR), "big"), ec.SECP256R1())
     now = datetime.datetime.now(datetime.timezone.utc)
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "GoodGoodStudy synthetic test CA")])
@@ -63,9 +70,6 @@ def main():
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append({"clientPublicKey": body["clientPublicKey"], "clientNonce": body["clientNonce"]})
-            if self.headers.get("Authorization") != "Bearer " + profile["accessToken"]:
-                self.reply(401, {})
-                return
             if mode in ("401", "403", "429", "500"):
                 self.reply(int(mode), {})
                 return
@@ -78,7 +82,7 @@ def main():
                 return
             if mode == "timeout" and len(requests) == 1:
                 time.sleep(0.5)
-            response = make_response(body, {"intervalSeconds": 42, "mail": {"enabled": False}})
+            response = make_response(body, {"intervalSeconds": 42, "mail": {"enabled": False}}, signing_key=signing_key)
             if mode == "bad_mac":
                 tag = bytearray(base64.b64decode(response["payload"]["mac"]))
                 tag[0] ^= 1

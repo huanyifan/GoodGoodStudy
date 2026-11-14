@@ -416,7 +416,7 @@ func runApp(address, root string) error {
 		return e
 	}
 	c, e := fetchConfig(address, profile)
-	profile.Token = ""
+	profile.Key = ""
 	if e != nil {
 		return e
 	}

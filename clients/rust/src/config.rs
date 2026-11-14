@@ -2,6 +2,10 @@ use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use p256::ecdsa::{
+    signature::{Signer, Verifier},
+    Signature, SigningKey, VerifyingKey,
+};
 use p256::{ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -10,8 +14,35 @@ use std::{path::Path, time::Duration};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub type Result<T> = std::result::Result<T, &'static str>;
 pub const ENDPOINT: &str = "https://yifan.im/tools/goodgoodstudy/config.json";
-pub const PROTOCOL: &str = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v2";
+pub const PROTOCOL: &str = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v3";
 pub const ALGORITHM: &str = "AES-256-CBC+HMAC-SHA256";
+pub const REQUEST_DOMAIN: &str = "GoodGoodStudy.Config.Request.v3";
+pub const RESPONSE_DOMAIN: &str = "GoodGoodStudy.Config.Response.v3";
+// The server's long-term ECDSA P-256 public key (SEC1 uncompressed, Base64),
+// compiled in so an interceptor that terminates TLS still cannot forge
+// configuration. Replace with the key from `config_admin --keygen-signing-key`
+// on the production server before building release binaries.
+pub const SERVER_SIGNING_KEY: &str =
+    "BB1aUS2J5pMwW4V7f7MuysLUoaI4XP8uAYi5uLqR0eSN69aM2DlHoWNqtfpTjWsIpaFAQSsb+ZAganwl66HbJXo=";
+
+fn transcript(domain: &str, device: &str, first: &[u8], second: &[u8], third: &[u8], fourth: &[u8], timestamp: i64) -> Vec<u8> {
+    let mut message = format!("{domain}|{device}|").into_bytes();
+    message.extend_from_slice(first);
+    message.extend_from_slice(second);
+    message.extend_from_slice(third);
+    message.extend_from_slice(fourth);
+    message.extend_from_slice(&timestamp.to_be_bytes());
+    message
+}
+pub fn verifying_key_from_b64(encoded: &str) -> Result<VerifyingKey> {
+    let raw = B64
+        .decode(encoded)
+        .map_err(|_| "invalid server signing key")?;
+    VerifyingKey::from_sec1_bytes(&raw).map_err(|_| "invalid server signing key")
+}
+pub fn server_verifying_key() -> Result<VerifyingKey> {
+    verifying_key_from_b64(SERVER_SIGNING_KEY)
+}
 
 pub type TraceSink<'a> = Option<&'a mut dyn FnMut(serde_json::Value)>;
 fn emit(sink: &mut TraceSink<'_>, step: &str, details: serde_json::Value) {
@@ -24,29 +55,32 @@ fn emit(sink: &mut TraceSink<'_>, step: &str, details: serde_json::Value) {
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
     pub device_id: String,
-    pub access_token: String,
+    pub device_key: String,
 }
 impl Profile {
     pub fn create() -> Self {
-        let mut token = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(&mut *token);
+        let signing = SigningKey::random(&mut OsRng);
+        let scalar = Zeroizing::new(signing.to_bytes());
         Self {
             device_id: uuid::Uuid::new_v4().to_string(),
-            access_token: B64.encode(token.as_slice()),
+            device_key: B64.encode(scalar.as_slice()),
         }
     }
     pub fn validate(&self) -> Result<()> {
         if self.device_id.len() != 36 || uuid::Uuid::parse_str(&self.device_id).is_err() {
             return Err("invalid device ID");
         }
-        let token = Zeroizing::new(
-            B64.decode(&self.access_token)
+        self.signing_key().map(|_| ())
+    }
+    pub fn signing_key(&self) -> Result<SigningKey> {
+        let scalar = Zeroizing::new(
+            B64.decode(&self.device_key)
                 .map_err(|_| "invalid credential")?,
         );
-        if token.len() != 32 || B64.encode(&*token) != self.access_token {
+        if scalar.len() != 32 || B64.encode(&*scalar) != self.device_key {
             return Err("invalid credential");
         }
-        Ok(())
+        SigningKey::from_slice(&scalar).map_err(|_| "invalid credential")
     }
 }
 #[derive(Deserialize, Serialize)]
@@ -138,6 +172,8 @@ pub struct Handshake {
     device_id: String,
     client_public_key: String,
     client_nonce: String,
+    timestamp: i64,
+    signature: String,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +191,14 @@ pub struct Response {
     key_agreement: String,
     server_public_key: String,
     server_nonce: String,
+    #[serde(default)]
+    timestamp: i64,
+    #[serde(default)]
+    signature: String,
+    // Debug bridge only: lets --debug-crypto trust a per-run key. The production
+    // fetch path ignores this field and always uses the compiled SERVER_SIGNING_KEY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_signing_key: Option<String>,
     payload: Envelope,
 }
 pub struct Session {
@@ -162,9 +206,17 @@ pub struct Session {
     pub request: Handshake,
     point: Vec<u8>,
     nonce: [u8; 32],
+    timestamp: i64,
+}
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 impl Session {
-    pub fn new(device: &str) -> Self {
+    pub fn new(profile: &Profile) -> Result<Self> {
+        let signing = profile.signing_key()?;
         let secret = EphemeralSecret::random(&mut OsRng);
         let point = PublicKey::from(&secret)
             .to_encoded_point(false)
@@ -172,21 +224,27 @@ impl Session {
             .to_vec();
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
+        let timestamp = now_seconds();
+        let message = transcript(REQUEST_DOMAIN, &profile.device_id, &point, &nonce, &[], &[], timestamp);
+        let signature: Signature = signing.sign(&message);
         let request = Handshake {
-            version: 2,
-            device_id: device.to_owned(),
+            version: 3,
+            device_id: profile.device_id.clone(),
             client_public_key: B64.encode(&point),
             client_nonce: B64.encode(nonce),
+            timestamp,
+            signature: B64.encode(signature.to_bytes()),
         };
-        Self {
+        Ok(Self {
             secret,
             request,
             point,
             nonce,
-        }
+            timestamp,
+        })
     }
-    pub fn decrypt(&self, r: &Response) -> Result<Config> {
-        self.decrypt_with_trace(r, None)
+    pub fn decrypt(&self, r: &Response, verifier: &VerifyingKey) -> Result<Config> {
+        self.decrypt_with_trace(r, verifier, None)
     }
     pub fn trace_handshake(&self, mut trace: TraceSink<'_>) {
         emit(
@@ -199,11 +257,17 @@ impl Session {
             }),
         );
     }
-    pub fn decrypt_with_trace(&self, r: &Response, mut trace: TraceSink<'_>) -> Result<Config> {
-        if r.version != 2
+    pub fn decrypt_with_trace(
+        &self,
+        r: &Response,
+        verifier: &VerifyingKey,
+        mut trace: TraceSink<'_>,
+    ) -> Result<Config> {
+        if r.version != 3
             || r.key_agreement != PROTOCOL
             || r.payload.version != 1
             || r.payload.algorithm != ALGORITHM
+            || r.timestamp != self.timestamp
         {
             return Err("invalid session response");
         }
@@ -218,6 +282,32 @@ impl Session {
         if nonce.len() != 32 {
             return Err("invalid nonce");
         }
+        // Authenticate the server's ephemeral key and nonce before any key agreement,
+        // so a TLS interceptor cannot substitute its own ECDH point.
+        let signature_bytes = B64.decode(&r.signature).map_err(|_| "invalid signature")?;
+        let signature =
+            Signature::from_slice(&signature_bytes).map_err(|_| "invalid signature")?;
+        let signed = transcript(
+            RESPONSE_DOMAIN,
+            &self.request.device_id,
+            &public,
+            &self.point,
+            &nonce,
+            &self.nonce,
+            self.timestamp,
+        );
+        verifier
+            .verify(&signed, &signature)
+            .map_err(|_| "server signature invalid")?;
+        emit(
+            &mut trace,
+            "03c.server_signature_verified",
+            serde_json::json!({
+                "domain":RESPONSE_DOMAIN, "signatureBase64":r.signature,
+                "transcriptLayout":"domain || '|' || device || '|' || server_public[65] || client_public[65] || server_nonce[32] || client_nonce[32] || timestamp[8]",
+                "verified":true
+            }),
+        );
         emit(
             &mut trace,
             "04.validate_server_handshake",
@@ -245,6 +335,7 @@ impl Session {
         info.extend_from_slice(&public);
         info.extend_from_slice(&self.nonce);
         info.extend_from_slice(&nonce);
+        info.extend_from_slice(&self.timestamp.to_be_bytes());
         let mut key = Zeroizing::new([0u8; 64]);
         Hkdf::<Sha256>::new(Some(&salt), &hashed)
             .expand(&info, &mut *key)
@@ -254,7 +345,7 @@ impl Session {
             "06.hkdf_sha256",
             serde_json::json!({
                 "saltLayout":"client_nonce[32] || server_nonce[32]", "saltBase64":B64.encode(&salt),
-                "infoLayout":"UTF8(protocol + '|' + device_id + '|') || client_public[65] || server_public[65] || client_nonce[32] || server_nonce[32]",
+                "infoLayout":"UTF8(protocol + '|' + device_id + '|') || client_public[65] || server_public[65] || client_nonce[32] || server_nonce[32] || timestamp[8]",
                 "infoBytes":info.len(), "infoSha256":format!("{:x}",Sha256::digest(&info)),
                 "outputBytes":64, "split":"OKM[0..32] = AES-256 key; OKM[32..64] = HMAC-SHA256 key",
                 "keys":"[memory only; redacted]"
@@ -444,7 +535,8 @@ fn fetch_attempt(
     trace: &mut TraceSink<'_>,
     client: &reqwest::blocking::Client,
 ) -> std::result::Result<Config, FetchFailure> {
-    let session = Session::new(&profile.device_id);
+    let verifier = server_verifying_key().map_err(FetchFailure::from)?;
+    let session = Session::new(profile).map_err(FetchFailure::from)?;
     session.trace_handshake(
         trace
             .as_mut()
@@ -455,13 +547,12 @@ fn fetch_attempt(
         "02.https_request",
         serde_json::json!({
             "method":"POST", "host":url.host_str(), "path":url.path(), "tlsCertificateVerification":true,
-            "redirectsAllowed":false, "timeoutSeconds":15, "connectTimeoutSeconds":5, "authorization":"Bearer [redacted]",
-            "requestBody":"version, deviceId, clientPublicKey, clientNonce; no private key or session encryption key"
+            "redirectsAllowed":false, "timeoutSeconds":15, "connectTimeoutSeconds":5, "authentication":"ECDSA request signature; no bearer token",
+            "requestBody":"version, deviceId, clientPublicKey, clientNonce, timestamp, signature; no private key or session encryption key"
         }),
     );
     let response = client
         .post(url.clone())
-        .bearer_auth(&profile.access_token)
         .json(&session.request)
         .send()
         .map_err(|error| {
@@ -523,6 +614,7 @@ fn fetch_attempt(
     session
         .decrypt_with_trace(
             &r,
+            &verifier,
             trace
                 .as_mut()
                 .map(|sink| &mut **sink as &mut dyn FnMut(serde_json::Value)),
@@ -575,6 +667,14 @@ mod retry_tests;
 mod tests {
     use super::*;
     use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    use std::sync::OnceLock;
+    fn test_server_key() -> &'static SigningKey {
+        static KEY: OnceLock<SigningKey> = OnceLock::new();
+        KEY.get_or_init(|| SigningKey::random(&mut OsRng))
+    }
+    fn test_verifier() -> VerifyingKey {
+        *test_server_key().verifying_key()
+    }
     fn reply(client: &Session) -> Response {
         reply_with_plain(client, br#"{"intervalSeconds":42}"#)
     }
@@ -596,6 +696,7 @@ mod tests {
         info.extend_from_slice(&public);
         info.extend_from_slice(&client.nonce);
         info.extend_from_slice(&nonce);
+        info.extend_from_slice(&client.timestamp.to_be_bytes());
         let mut key = Zeroizing::new([0u8; 64]);
         Hkdf::<Sha256>::new(Some(&salt), &hashed)
             .expand(&info, &mut *key)
@@ -609,11 +710,24 @@ mod tests {
         mac.update(format!("GoodGoodStudy.Config.v1|{}|", ALGORITHM).as_bytes());
         mac.update(&iv);
         mac.update(&encrypted);
+        let signed = transcript(
+            RESPONSE_DOMAIN,
+            &client.request.device_id,
+            &public,
+            &client.point,
+            &nonce,
+            &client.nonce,
+            client.timestamp,
+        );
+        let signature: Signature = test_server_key().sign(&signed);
         Response {
-            version: 2,
+            version: 3,
             key_agreement: PROTOCOL.into(),
             server_public_key: B64.encode(public),
             server_nonce: B64.encode(nonce),
+            timestamp: client.timestamp,
+            signature: B64.encode(signature.to_bytes()),
+            server_signing_key: None,
             payload: Envelope {
                 version: 1,
                 algorithm: ALGORITHM.into(),
@@ -625,17 +739,23 @@ mod tests {
     }
     #[test]
     fn session_round_trip() {
-        let s = Session::new(&uuid::Uuid::new_v4().to_string());
-        assert_eq!(s.decrypt(&reply(&s)).unwrap().interval_seconds, 42);
+        let s = Session::new(&Profile::create()).unwrap();
+        assert_eq!(
+            s.decrypt(&reply(&s), &test_verifier())
+                .unwrap()
+                .interval_seconds,
+            42
+        );
     }
     #[test]
     fn debug_trace_redacts_config_and_never_decrypts_unauthenticated_data() {
-        let id = uuid::Uuid::new_v4().to_string();
-        let s = Session::new(&id);
+        let profile = Profile::create();
+        let id = profile.device_id.clone();
+        let s = Session::new(&profile).unwrap();
         let mut response = reply_with_plain(&s, br#"{"mail":{"password":"SYNTHETIC-DO-NOT-LOG-SECRET","sender":"private@example.test","username":"SYNTHETIC-USERNAME"}}"#);
         let mut events = Vec::new();
         s.trace_handshake(Some(&mut |event| events.push(event)));
-        s.decrypt_with_trace(&response, Some(&mut |event| events.push(event)))
+        s.decrypt_with_trace(&response, &test_verifier(), Some(&mut |event| events.push(event)))
             .unwrap();
         let log = serde_json::to_string(&events).unwrap();
         for value in [
@@ -661,7 +781,7 @@ mod tests {
         response.payload.mac = B64.encode(tag);
         events.clear();
         assert_eq!(
-            s.decrypt_with_trace(&response, Some(&mut |event| events.push(event)))
+            s.decrypt_with_trace(&response, &test_verifier(), Some(&mut |event| events.push(event)))
                 .err(),
             Some("authentication failed")
         );
@@ -672,14 +792,14 @@ mod tests {
     }
     #[test]
     fn replay_rejected() {
-        let id = uuid::Uuid::new_v4().to_string();
-        let s = Session::new(&id);
-        let other = Session::new(&id);
-        assert!(other.decrypt(&reply(&s)).is_err());
+        let profile = Profile::create();
+        let s = Session::new(&profile).unwrap();
+        let other = Session::new(&profile).unwrap();
+        assert!(other.decrypt(&reply(&s), &test_verifier()).is_err());
     }
     #[test]
     fn fresh_ephemeral_response() {
-        let s = Session::new(&uuid::Uuid::new_v4().to_string());
+        let s = Session::new(&Profile::create()).unwrap();
         let a = reply(&s);
         let b = reply(&s);
         assert_ne!(a.server_public_key, b.server_public_key);
@@ -688,20 +808,27 @@ mod tests {
     }
     #[test]
     fn tampering_rejected() {
-        let s = Session::new(&uuid::Uuid::new_v4().to_string());
-        for field in ["mac", "iv", "ciphertext", "nonce"] {
+        let s = Session::new(&Profile::create()).unwrap();
+        for field in ["mac", "iv", "ciphertext", "nonce", "signature"] {
             let mut r = reply(&s);
             let value = match field {
                 "mac" => &mut r.payload.mac,
                 "iv" => &mut r.payload.iv,
                 "ciphertext" => &mut r.payload.ciphertext,
+                "signature" => &mut r.signature,
                 _ => &mut r.server_nonce,
             };
             let mut bytes = B64.decode(&*value).unwrap();
             bytes[0] ^= 1;
             *value = B64.encode(bytes);
-            assert!(s.decrypt(&r).is_err());
+            assert!(s.decrypt(&r, &test_verifier()).is_err());
         }
+    }
+    #[test]
+    fn untrusted_server_key_rejected() {
+        let s = Session::new(&Profile::create()).unwrap();
+        let stranger = SigningKey::random(&mut OsRng);
+        assert!(s.decrypt(&reply(&s), stranger.verifying_key()).is_err());
     }
     #[test]
     fn configuration_boundaries() {
@@ -725,7 +852,7 @@ mod tests {
         let p = Profile::create();
         assert!(p.validate().is_ok());
         let mut bad = Profile::create();
-        bad.access_token = "invalid".into();
+        bad.device_key = "invalid".into();
         assert!(bad.validate().is_err());
     }
     #[test]

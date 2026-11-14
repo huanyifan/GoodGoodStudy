@@ -16,14 +16,67 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 from cryptography.hazmat.primitives import hashes, padding, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.exceptions import InvalidSignature
 
 PROTOCOL = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v2"
+PROTOCOL_V3 = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v3"
 ALGORITHM = "AES-256-CBC+HMAC-SHA256"
 ENDPOINT = "/tools/goodgoodstudy/config.json"
 MAX_REQUEST = 4096
 MAX_CONFIG = 65536
+# v3 authenticates both directions with ECDSA P-256 over domain-separated transcripts.
+REQUEST_DOMAIN = b"GoodGoodStudy.Config.Request.v3"
+RESPONSE_DOMAIN = b"GoodGoodStudy.Config.Response.v3"
+MAX_CLOCK_SKEW = 300
+NONCE_TTL = 300
+P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+
+class AuthError(Exception):
+    """Well-formed request that failed authentication (maps to HTTP 401)."""
+
+
+def sign_raw(private_key, message):
+    # Fixed 64-byte r||s, low-S normalised so strict verifiers (RustCrypto) accept it.
+    r, s = decode_dss_signature(private_key.sign(message, ec.ECDSA(hashes.SHA256())))
+    if s > P256_ORDER // 2:
+        s = P256_ORDER - s
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def verify_raw(public_key, signature, message):
+    if len(signature) != 64:
+        raise InvalidSignature("signature length")
+    r = int.from_bytes(signature[:32], "big")
+    s = int.from_bytes(signature[32:], "big")
+    if not (1 <= r < P256_ORDER and 1 <= s < P256_ORDER):
+        raise InvalidSignature("signature range")
+    public_key.verify(encode_dss_signature(r, s), message, ec.ECDSA(hashes.SHA256()))
+
+
+def request_transcript(device, client_public, client_nonce, timestamp):
+    return (REQUEST_DOMAIN + b"|" + device.encode("utf-8") + b"|"
+            + client_public + client_nonce + timestamp.to_bytes(8, "big"))
+
+
+def response_transcript(device, server_public, client_public, server_nonce, client_nonce, timestamp):
+    return (RESPONSE_DOMAIN + b"|" + device.encode("utf-8") + b"|"
+            + server_public + client_public + server_nonce + client_nonce + timestamp.to_bytes(8, "big"))
+
+
+def valid_timestamp(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**63
+
+
+def load_signing_key(data_dir):
+    raw = json.loads((Path(data_dir) / "signing-key.json").read_text("utf-8"))
+    scalar = base64.b64decode(raw["privateKey"], validate=True)
+    if len(scalar) != 32:
+        raise ValueError("invalid signing key")
+    return ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
 
 def b64(value):
     return base64.b64encode(value).decode("ascii")
@@ -36,14 +89,23 @@ def unb64(value, length):
         raise ValueError("invalid field length")
     return result
 
-def make_response(request, configuration, trace=None):
-    if request.get("version") != 2:
+def make_response(request, configuration, signing_key=None, trace=None):
+    version = request.get("version")
+    if version not in (2, 3):
         raise ValueError("unsupported version")
     device = request["deviceId"]
     client_nonce = unb64(request["clientNonce"], 32)
     client_public = unb64(request["clientPublicKey"], 65)
     if client_public[0] != 4:
         raise ValueError("uncompressed P-256 point required")
+    protocol = PROTOCOL_V3 if version == 3 else PROTOCOL
+    timestamp = None
+    if version == 3:
+        timestamp = request["timestamp"]
+        if not valid_timestamp(timestamp):
+            raise ValueError("invalid timestamp")
+        if signing_key is None:
+            raise ValueError("server signing key unavailable")
     peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), client_public)
     ephemeral = ec.generate_private_key(ec.SECP256R1())
     server_public = ephemeral.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
@@ -55,7 +117,10 @@ def make_response(request, configuration, trace=None):
             pointOnCurve=True, privateKey="[memory only; redacted]")
     # Windows CNG's SHA256 KDF hashes the raw ECDH agreement before HKDF.
     hashed_secret = bytearray(hashlib.sha256(ephemeral.exchange(ec.ECDH(), peer)).digest())
-    info = (PROTOCOL + "|" + device + "|").encode("utf-8") + client_public + server_public + client_nonce + server_nonce
+    info = (protocol + "|" + device + "|").encode("utf-8") + client_public + server_public + client_nonce + server_nonce
+    if version == 3:
+        # Bind the derived key to the signed timestamp so a key cannot outlive its transcript.
+        info += timestamp.to_bytes(8, "big")
     session_key = bytearray(HKDF(algorithm=hashes.SHA256(), length=64,
         salt=client_nonce + server_nonce, info=info).derive(bytes(hashed_secret)))
     try:
@@ -83,9 +148,18 @@ def make_response(request, configuration, trace=None):
                 ciphertextSha256=hashlib.sha256(ciphertext).hexdigest(), macBase64=b64(tag),
                 macInputLayout="ASCII('GoodGoodStudy.Config.v1|" + ALGORITHM + "|') || IV[16] || ciphertext",
                 macBytes=len(tag), order="encrypt then MAC; client must verify MAC before decryption")
-        return {"version": 2, "keyAgreement": PROTOCOL, "serverPublicKey": b64(server_public),
+        response = {"version": version, "keyAgreement": protocol, "serverPublicKey": b64(server_public),
             "serverNonce": b64(server_nonce), "payload": {"version": 1, "algorithm": ALGORITHM,
             "iv": b64(iv), "ciphertext": b64(ciphertext), "mac": b64(tag)}}
+        if version == 3:
+            response["timestamp"] = timestamp
+            transcript = response_transcript(device, server_public, client_public, server_nonce, client_nonce, timestamp)
+            response["signature"] = b64(sign_raw(signing_key, transcript))
+            if trace:
+                trace("03b.sign_response", domain=RESPONSE_DOMAIN.decode("ascii"),
+                    transcriptLayout="domain || '|' || device || '|' || server_public[65] || client_public[65] || server_nonce[32] || client_nonce[32] || timestamp[8]",
+                    signatureEncoding="ECDSA P-256 / SHA-256, raw r||s, 64 bytes, low-S", signatureBase64=response["signature"])
+        return response
     finally:
         hashed_secret[:] = b"\0" * len(hashed_secret)
         session_key[:] = b"\0" * len(session_key)
@@ -97,7 +171,17 @@ class ConfigService:
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.rate = defaultdict(deque)
+        self.rate_ip = defaultdict(deque)
+        self.nonces = {}
         self.lock = threading.Lock()
+        try:
+            self.signing_key = load_signing_key(self.data_dir)
+        except (OSError, ValueError, KeyError):
+            # v2-only deployments run without a signing key; v3 requests then get 401.
+            self.signing_key = None
+
+    def devices(self):
+        return json.loads((self.data_dir / "devices.json").read_text("utf-8"))
 
     def authorized(self, device, header):
         if not isinstance(device, str) or len(device) != 36 or not header.startswith("Bearer "):
@@ -105,23 +189,84 @@ class ConfigService:
         token = header[7:]
         try:
             unb64(token, 32)
-            devices = json.loads((self.data_dir / "devices.json").read_text("utf-8"))
-            expected = devices.get(device, "")
+            expected = self.devices().get(device, "")
             actual = hashlib.sha256(token.encode("ascii")).hexdigest()
-            return len(expected) == 64 and hmac.compare_digest(actual, expected)
+            # v3 entries are objects, not hex strings, so they never satisfy the v2 path.
+            return isinstance(expected, str) and len(expected) == 64 and hmac.compare_digest(actual, expected)
         except (ValueError, OSError, UnicodeError):
             return False
 
-    def allow(self, device):
+    def device_public_key(self, device):
+        if not isinstance(device, str) or len(device) != 36:
+            return None
+        try:
+            entry = self.devices().get(device)
+        except (ValueError, OSError, UnicodeError):
+            return None
+        if not isinstance(entry, dict):
+            return None
+        try:
+            raw = base64.b64decode(entry.get("publicKey", ""), validate=True)
+            if len(raw) != 65 or raw[0] != 4:
+                return None
+            return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+        except (ValueError, TypeError):
+            return None
+
+    def _allow(self, bucket, key, limit):
         now = time.monotonic()
         with self.lock:
-            recent = self.rate[device]
+            recent = bucket[key]
             while recent and recent[0] < now - 60:
                 recent.popleft()
-            if len(recent) >= 60:
+            if len(recent) >= limit:
                 return False
             recent.append(now)
             return True
+
+    def allow(self, device):
+        return self._allow(self.rate, device, 60)
+
+    def allow_ip(self, ip):
+        return self._allow(self.rate_ip, ip, 120)
+
+    def fresh_nonce(self, nonce_b64):
+        now = time.monotonic()
+        with self.lock:
+            if len(self.nonces) > 200000:
+                self.nonces.clear()
+            for key in [k for k, expiry in self.nonces.items() if expiry < now]:
+                del self.nonces[key]
+            if nonce_b64 in self.nonces:
+                return False
+            self.nonces[nonce_b64] = now + NONCE_TTL
+            return True
+
+    def authenticate_v3(self, request):
+        # Raises AuthError (401) on auth failure, ValueError (400) on malformed input.
+        if self.signing_key is None:
+            raise AuthError("v3 unavailable")
+        device = request.get("deviceId")
+        public_key = self.device_public_key(device)
+        if public_key is None:
+            raise AuthError("unknown device")
+        client_public = unb64(request["clientPublicKey"], 65)
+        client_nonce = unb64(request["clientNonce"], 32)
+        if client_public[0] != 4:
+            raise ValueError("uncompressed P-256 point required")
+        timestamp = request["timestamp"]
+        if not valid_timestamp(timestamp):
+            raise ValueError("invalid timestamp")
+        if abs(timestamp - int(time.time())) > MAX_CLOCK_SKEW:
+            raise AuthError("stale timestamp")
+        signature = base64.b64decode(request["signature"], validate=True)
+        try:
+            verify_raw(public_key, signature, request_transcript(device, client_public, client_nonce, timestamp))
+        except InvalidSignature:
+            raise AuthError("bad signature")
+        if not self.fresh_nonce(request["clientNonce"]):
+            raise AuthError("replayed nonce")
+        return device
 
     def configuration(self):
         path = self.data_dir / "config.json"
@@ -164,20 +309,32 @@ def handler_for(service):
                 if length < 1 or length > MAX_REQUEST:
                     raise ValueError("invalid body size")
                 body = self.rfile.read(length)
-                if not self.headers.get("Authorization", "").startswith("Bearer "):
-                    self.reply(401, {"error": "unauthorized"})
+                # Per-IP limit is applied before any authentication work.
+                if not service.allow_ip(self.client_address[0]):
+                    self.reply(429, {"error": "rate_limited"})
                     return
                 request = json.loads(body.decode("utf-8"))
                 if not isinstance(request, dict):
                     raise ValueError("invalid body")
-                device = request.get("deviceId")
-                if not service.authorized(device, self.headers.get("Authorization", "")):
+                version = request.get("version")
+                try:
+                    if version == 2:
+                        device = request.get("deviceId")
+                        if not service.authorized(device, self.headers.get("Authorization", "")):
+                            raise AuthError("unauthorized")
+                        signing_key = None
+                    elif version == 3:
+                        device = service.authenticate_v3(request)
+                        signing_key = service.signing_key
+                    else:
+                        raise ValueError("unsupported version")
+                except AuthError:
                     self.reply(401, {"error": "unauthorized"})
                     return
                 if not service.allow(device):
                     self.reply(429, {"error": "rate_limited"})
                     return
-                result = make_response(request, service.configuration())
+                result = make_response(request, service.configuration(), signing_key=signing_key)
             except (ValueError, KeyError, TypeError, UnicodeError):
                 self.reply(400, {"error": "invalid_request"})
                 return

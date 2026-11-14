@@ -14,20 +14,20 @@ python -B .\tools\debug_crypto.py --exe C:\private\GoodGoodStudy.exe --output-di
 
 ## 协议的实际步骤
 
-1. Windows DPAPI 解开长期设备凭据，HTTPS POST 的 `Authorization: Bearer` 携带访问令牌。服务器校验令牌哈希并限制速率。TLS 校验系统信任证书，拒绝重定向。访问令牌用于鉴权，不是 AES 密钥。
-2. 客户端生成一次性 P-256 私钥 `c`、公钥 `C=cG` 和 32 字节随机 `Nc`。提交协议版本、设备 ID、`C`、`Nc`。公钥编码为 65 字节 SEC1 非压缩点（04 || X || Y），再 Base64。
+1. Windows DPAPI 解开长期设备私钥（ECDSA P-256）。请求不再携带 Bearer 令牌：客户端用设备私钥对 `REQUEST_DOMAIN||"|"||deviceId||"|"||C||Nc||时间戳[8]` 签名（`REQUEST_DOMAIN=GoodGoodStudy.Config.Request.v3`）。服务器用登记的设备公钥验签，校验时间戳在 ±300 秒内、nonce 未重放，并按 IP 限流（均在验签前后）。TLS 校验系统信任证书，拒绝重定向。设备私钥用于鉴权签名，不是 AES 密钥。
+2. 客户端生成一次性 P-256 ECDH 私钥 `c`、公钥 `C=cG` 和 32 字节随机 `Nc`，带当前时间戳。提交协议版本 3、设备 ID、`C`、`Nc`、时间戳、签名。公钥编码为 65 字节 SEC1 非压缩点（04 || X || Y），再 Base64。
 3. 服务器校验客户端曲线点，生成一次性私钥 `s`、公钥 `S=sG` 和 32 字节随机 `Ns`。服务器计算 `Z=ECDH(s,C)`；客户端之后计算 `Z=ECDH(c,S)`，二者得到相同共享秘密。双方先计算 `IKM=SHA256(Z)`，与原 Windows CNG 协议兼容。
-4. 双方执行 HKDF-SHA256，输出 64 字节：`salt=Nc||Ns`（64 字节）；`info=UTF8(protocol+"|"+deviceId+"|")||C||S||Nc||Ns`。当前协议标识为 `GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v2`。输出前 32 字节用于 AES，后 32 字节用于 HMAC。
+4. 双方执行 HKDF-SHA256，输出 64 字节：`salt=Nc||Ns`（64 字节）；`info=UTF8(protocol+"|"+deviceId+"|")||C||S||Nc||Ns||时间戳[8]`。当前协议标识为 `GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v3`。输出前 32 字节用于 AES，后 32 字节用于 HMAC。
 5. 服务器将配置序列化为 UTF-8 JSON，执行 PKCS#7 填充（块大小 16 字节），生成随机 16 字节 IV，再执行 AES-256-CBC 加密。
-6. 服务器计算 `tag=HMAC-SHA256(Kmac, prefix||IV||ciphertext)`，其中 `prefix=ASCII("GoodGoodStudy.Config.v1|AES-256-CBC+HMAC-SHA256|")`。响应携带服务端公钥、nonce、协议标识、IV、密文与 32 字节 tag；不携带私钥、共享秘密或会话密钥。
-7. 客户端验证版本、算法、曲线点、nonce 和长度，使用本次临时私钥派生同样的两把密钥，先以常量时间方式验证 HMAC。只有验证通过才进行 AES 解密、PKCS#7 去填充、JSON 与配置范围校验。
+6. 服务器计算 `tag=HMAC-SHA256(Kmac, prefix||IV||ciphertext)`，其中 `prefix=ASCII("GoodGoodStudy.Config.v1|AES-256-CBC+HMAC-SHA256|")`。服务器再用长期签名私钥对 `RESPONSE_DOMAIN||"|"||deviceId||"|"||S||C||Ns||Nc||时间戳[8]` 签名（`RESPONSE_DOMAIN=GoodGoodStudy.Config.Response.v3`，ECDSA P-256/SHA-256，raw r||s，低 S）。响应携带服务端公钥、nonce、协议标识、时间戳、服务端签名、IV、密文与 32 字节 tag；不携带私钥、共享秘密或会话密钥。
+7. 客户端先用内置的服务端公钥验签，并校验响应时间戳与请求一致；再验证版本、算法、曲线点、nonce 和长度，使用本次临时私钥派生同样的两把密钥，以常量时间方式验证 HMAC。只有全部通过才进行 AES 解密、PKCS#7 去填充、JSON 与配置范围校验。`--debug-crypto` 的本机桥用每次运行新生成的签名密钥，并在响应中附带其公钥，供本机客户端验证；真实部署里客户端只信任编译进来的服务端公钥。
 8. 临时密钥不序列化；Rust 使用 Zeroizing 和密码学类型析构清理。Python 清理显式字节数组，库内部临时副本由 Python/OpenSSL 管理；这不等于保证清除操作系统换页或所有内存副本。
 
 ## 如何读日志
 
 - `side=server` 是本机 Python 实际加密函数的记录；线上部分的 `side=client` 来自 Rust 对真实 HTTPS 响应的处理，不声称读取了线上服务器进程内存。
 - 日志打印双方公钥、nonce、IV、HMAC、密文长度与摘要，以及 HKDF salt、info 布局／长度／摘要。双方公开参数完全匹配且 HMAC、解密成功，证明本次派生与加解密互通。
-- 私钥、Z、IKM、两把派生密钥、访问令牌、邮箱地址、SMTP 密码和完整配置明文均不打印；不会为诊断额外记录这些秘密的指纹。
+- 私钥、Z、IKM、两把派生密钥、设备私钥与签名、邮箱地址、SMTP 密码和完整配置明文均不打印；不会为诊断额外记录这些秘密的指纹。
 - 工具断言双方公钥、nonce、HKDF 公开输入和加密信封一致；篡改 MAC、IV、密文或服务器 nonce 必须被拒绝；旧响应交给另一个临时会话必须被拒绝。两次线上请求的双方公钥、nonce、IV、密文摘要必须变化。
 - 3.2.1 的每次网络重试会重新产生握手；调试工具关联最终成功尝试的参数。`00.fetch_attempt`、`11.retry_scheduled`、`12.transport_failure` 分别记录尝试次数、等待与脱敏传输错误。正常运行只把重试、传输故障及非200状态写入 runtime.log，不落盘正常握手参数。
 - 跨会话重放检测依靠临时密钥和握手绑定；同一 Session 对象重复处理同一合法响应没有单独的已消费标记。生产获取流程每次创建新 Session，仅处理一次响应。
@@ -38,7 +38,7 @@ python -B .\tools\debug_crypto.py --exe C:\private\GoodGoodStudy.exe --output-di
 
 脚本在当前用户私有构建目录创建独立测试数据目录，复制 DPAPI 密文凭据，仅为子进程覆盖 LOCALAPPDATA；正常后台运行程序，检查第二实例被拒绝，等待一张真实截图，发出正常停止事件，验证 PNG 可解码、退出码为 0、邮件队列为空。结果在该目录的 runtime-test.json、stdout.log、stderr.log 和 GoodGoodStudy/runtime.log 中；图片也保留在该私有目录。不会安装登录启动任务或等待累积到发送批次。
 
-普通运行失败也会将脱敏静态原因写入 runtime.log；HTTPS 传输失败时，stderr 仅补充连接类别、超时标志和操作系统错误码，不输出请求头、令牌或完整网络异常对象。
+普通运行失败也会将脱敏静态原因写入 runtime.log；HTTPS 传输失败时，stderr 仅补充连接类别、超时标志和操作系统错误码，不输出请求头、签名或完整网络异常对象。
 
 ## 启动稳定性与 HTTPS 故障注入
 

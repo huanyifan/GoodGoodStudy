@@ -5,15 +5,19 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -24,14 +28,24 @@ import (
 )
 
 const endpoint = "https://yifan.im/tools/goodgoodstudy/config.json"
-const protocol = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v2"
+const protocol = "GoodGoodStudy.Config.ECDH-P256.HKDF-SHA256.v3"
 const algorithm = "AES-256-CBC+HMAC-SHA256"
+const requestDomain = "GoodGoodStudy.Config.Request.v3"
+const responseDomain = "GoodGoodStudy.Config.Response.v3"
+const maxClockSkew = 300
+
+// serverSigningKey is the server's long-term ECDSA P-256 public key (SEC1
+// uncompressed, Base64). It is compiled in so a tampered or impersonated server
+// cannot forge configuration even when TLS is terminated by an interceptor.
+// Replace this with the public key printed by `config_admin --keygen-signing-key`
+// on the production server before building release binaries.
+var serverSigningKey = "BB1aUS2J5pMwW4V7f7MuysLUoaI4XP8uAYi5uLqR0eSN69aM2DlHoWNqtfpTjWsIpaFAQSsb+ZAganwl66HbJXo="
 
 var invalid = errors.New("configuration or device credential invalid")
 
 type Profile struct {
 	DeviceID string `json:"deviceId"`
-	Token    string `json:"accessToken"`
+	Key      string `json:"deviceKey"`
 }
 type MailConfig struct {
 	Enabled   bool   `json:"enabled"`
@@ -75,13 +89,24 @@ func decodeConfig(b []byte) (Config, error) {
 	}
 	return c, nil
 }
+func deviceScalar(key string) ([]byte, error) {
+	b, e := base64.StdEncoding.Strict().DecodeString(key)
+	if e != nil || len(b) != 32 || base64.StdEncoding.EncodeToString(b) != key {
+		return nil, invalid
+	}
+	d := new(big.Int).SetBytes(b)
+	if d.Sign() == 0 || d.Cmp(elliptic.P256().Params().N) >= 0 {
+		return nil, invalid
+	}
+	return b, nil
+}
 func validateProfile(p Profile) error {
-	b, e := base64.StdEncoding.Strict().DecodeString(p.Token)
-	defer clear(b)
-	if e != nil || len(b) != 32 || base64.StdEncoding.EncodeToString(b) != p.Token || len(p.DeviceID) != 36 {
+	if len(p.DeviceID) != 36 {
 		return invalid
 	}
-	return nil
+	scalar, e := deviceScalar(p.Key)
+	defer clear(scalar)
+	return e
 }
 func random(n int) ([]byte, error) { b := make([]byte, n); _, e := rand.Read(b); return b, e }
 func newProfile() (Profile, error) {
@@ -91,20 +116,85 @@ func newProfile() (Profile, error) {
 	}
 	b[6] = (b[6] & 15) | 64
 	b[8] = (b[8] & 63) | 128
-	token, e := random(32)
+	key, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if e != nil {
 		return Profile{}, e
 	}
-	defer clear(token)
+	scalar := key.D.FillBytes(make([]byte, 32))
+	defer clear(scalar)
 	id := fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
-	return Profile{id, base64.StdEncoding.EncodeToString(token)}, nil
+	return Profile{id, base64.StdEncoding.EncodeToString(scalar)}, nil
+}
+
+func deviceSigningKey(scalar []byte) (*ecdsa.PrivateKey, error) {
+	d := new(big.Int).SetBytes(scalar)
+	if d.Sign() == 0 || d.Cmp(elliptic.P256().Params().N) >= 0 {
+		return nil, invalid
+	}
+	k := &ecdsa.PrivateKey{D: d}
+	k.Curve = elliptic.P256()
+	k.X, k.Y = elliptic.P256().ScalarBaseMult(scalar)
+	return k, nil
+}
+func parseVerifyingKey(b64 string) (*ecdsa.PublicKey, error) {
+	raw, e := base64.StdEncoding.DecodeString(b64)
+	if e != nil || len(raw) != 65 || raw[0] != 4 {
+		return nil, invalid
+	}
+	x, y := elliptic.Unmarshal(elliptic.P256(), raw)
+	if x == nil {
+		return nil, invalid
+	}
+	return &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}, nil
+}
+func be64(v int64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(v))
+	return b
+}
+func requestTranscript(device string, clientPublic, clientNonce []byte, timestamp int64) []byte {
+	b := append([]byte(requestDomain+"|"+device+"|"), clientPublic...)
+	b = append(b, clientNonce...)
+	return append(b, be64(timestamp)...)
+}
+func responseTranscript(device string, serverPublic, clientPublic, serverNonce, clientNonce []byte, timestamp int64) []byte {
+	b := append([]byte(responseDomain+"|"+device+"|"), serverPublic...)
+	b = append(b, clientPublic...)
+	b = append(b, serverNonce...)
+	b = append(b, clientNonce...)
+	return append(b, be64(timestamp)...)
+}
+func signTranscript(key *ecdsa.PrivateKey, message []byte) (string, error) {
+	digest := sha256.Sum256(message)
+	r, s, e := ecdsa.Sign(rand.Reader, key, digest[:])
+	if e != nil {
+		return "", e
+	}
+	sig := append(r.FillBytes(make([]byte, 32)), s.FillBytes(make([]byte, 32))...)
+	return base64.StdEncoding.EncodeToString(sig), nil
+}
+func verifyTranscript(public *ecdsa.PublicKey, signature string, message []byte) bool {
+	sig, e := base64.StdEncoding.DecodeString(signature)
+	if e != nil || len(sig) != 64 {
+		return false
+	}
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	n := elliptic.P256().Params().N
+	if r.Sign() <= 0 || s.Sign() <= 0 || r.Cmp(n) >= 0 || s.Cmp(n) >= 0 {
+		return false
+	}
+	digest := sha256.Sum256(message)
+	return ecdsa.Verify(public, digest[:], r, s)
 }
 
 type Handshake struct {
-	Version  int    `json:"version"`
-	DeviceID string `json:"deviceId"`
-	Public   string `json:"clientPublicKey"`
-	Nonce    string `json:"clientNonce"`
+	Version   int    `json:"version"`
+	DeviceID  string `json:"deviceId"`
+	Public    string `json:"clientPublicKey"`
+	Nonce     string `json:"clientNonce"`
+	Timestamp int64  `json:"timestamp"`
+	Signature string `json:"signature"`
 }
 type Envelope struct {
 	Version    int    `json:"version"`
@@ -114,19 +204,31 @@ type Envelope struct {
 	MAC        string `json:"mac"`
 }
 type Response struct {
-	Version  int      `json:"version"`
-	Protocol string   `json:"keyAgreement"`
-	Public   string   `json:"serverPublicKey"`
-	Nonce    string   `json:"serverNonce"`
-	Payload  Envelope `json:"payload"`
+	Version   int      `json:"version"`
+	Protocol  string   `json:"keyAgreement"`
+	Public    string   `json:"serverPublicKey"`
+	Nonce     string   `json:"serverNonce"`
+	Timestamp int64    `json:"timestamp"`
+	Signature string   `json:"signature"`
+	Payload   Envelope `json:"payload"`
 }
 type Session struct {
 	private       *ecdh.PrivateKey
 	request       Handshake
 	public, nonce []byte
+	timestamp     int64
 }
 
-func newSession(id string) (*Session, error) {
+func newSession(p Profile) (*Session, error) {
+	scalar, e := deviceScalar(p.Key)
+	if e != nil {
+		return nil, e
+	}
+	defer clear(scalar)
+	signer, e := deviceSigningKey(scalar)
+	if e != nil {
+		return nil, e
+	}
 	key, e := ecdh.P256().GenerateKey(rand.Reader)
 	if e != nil {
 		return nil, e
@@ -136,7 +238,12 @@ func newSession(id string) (*Session, error) {
 		return nil, e
 	}
 	pub := key.PublicKey().Bytes()
-	return &Session{key, Handshake{2, id, base64.StdEncoding.EncodeToString(pub), base64.StdEncoding.EncodeToString(nonce)}, pub, nonce}, nil
+	timestamp := time.Now().Unix()
+	signature, e := signTranscript(signer, requestTranscript(p.DeviceID, pub, nonce, timestamp))
+	if e != nil {
+		return nil, e
+	}
+	return &Session{key, Handshake{3, p.DeviceID, base64.StdEncoding.EncodeToString(pub), base64.StdEncoding.EncodeToString(nonce), timestamp, signature}, pub, nonce, timestamp}, nil
 }
 func hkdf64(secret, salt, info []byte) []byte {
 	h := hmac.New(sha256.New, salt)
@@ -160,7 +267,10 @@ func hkdf64(secret, salt, info []byte) []byte {
 	return out
 }
 func (s *Session) decrypt(r Response) (Config, error) {
-	if r.Version != 2 || r.Protocol != protocol || r.Payload.Version != 1 || r.Payload.Algorithm != algorithm {
+	if r.Version != 3 || r.Protocol != protocol || r.Payload.Version != 1 || r.Payload.Algorithm != algorithm {
+		return Config{}, invalid
+	}
+	if r.Timestamp != s.timestamp {
 		return Config{}, invalid
 	}
 	pub, e := base64.StdEncoding.DecodeString(r.Public)
@@ -169,6 +279,13 @@ func (s *Session) decrypt(r Response) (Config, error) {
 	}
 	nonce, e := base64.StdEncoding.DecodeString(r.Nonce)
 	if e != nil || len(nonce) != 32 {
+		return Config{}, invalid
+	}
+	verifier, e := parseVerifyingKey(serverSigningKey)
+	if e != nil {
+		return Config{}, invalid
+	}
+	if !verifyTranscript(verifier, r.Signature, responseTranscript(s.request.DeviceID, pub, s.public, nonce, s.nonce, s.timestamp)) {
 		return Config{}, invalid
 	}
 	peer, e := ecdh.P256().NewPublicKey(pub)
@@ -187,6 +304,7 @@ func (s *Session) decrypt(r Response) (Config, error) {
 	info = append(info, pub...)
 	info = append(info, s.nonce...)
 	info = append(info, nonce...)
+	info = append(info, be64(s.timestamp)...)
 	key := hkdf64(hashed[:], salt, info)
 	defer clear(key)
 	iv, e := base64.StdEncoding.DecodeString(r.Payload.IV)
@@ -236,7 +354,7 @@ func fetchConfig(address string, p Profile) (Config, error) {
 	if e = validateProfile(p); e != nil {
 		return Config{}, e
 	}
-	session, e := newSession(p.DeviceID)
+	session, e := newSession(p)
 	if e != nil {
 		return Config{}, e
 	}
@@ -245,7 +363,6 @@ func fetchConfig(address string, p Profile) (Config, error) {
 	if e != nil {
 		return Config{}, invalid
 	}
-	req.Header.Set("Authorization", "Bearer "+p.Token)
 	req.Header.Set("Content-Type", "application/json")
 	client := http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect rejected") }}
 	response, e := client.Do(req)

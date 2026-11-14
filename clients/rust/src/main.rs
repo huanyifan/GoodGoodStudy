@@ -15,8 +15,8 @@ fn debug_crypto(bridge: &str) -> Result<()> {
         io::Write,
         process::{Command, Stdio},
     };
-    let device = uuid::Uuid::new_v4().to_string();
-    let session = config::Session::new(&device);
+    let profile = config::Profile::create();
+    let session = config::Session::new(&profile)?;
     session.trace_handshake(Some(&mut print_trace));
     let mut child = Command::new("python")
         .args(["-B", bridge])
@@ -40,7 +40,14 @@ fn debug_crypto(bridge: &str) -> Result<()> {
     }
     let response: config::Response =
         serde_json::from_slice(&output.stdout).map_err(|_| "invalid bridge response")?;
-    let c = session.decrypt_with_trace(&response, Some(&mut print_trace))?;
+    // The local bridge uses a per-run signing key, supplied in its response; the
+    // production fetch path never reads this field and trusts only the compiled key.
+    let verifier = response
+        .server_signing_key
+        .as_deref()
+        .ok_or("crypto bridge missing server signing key")
+        .and_then(config::verifying_key_from_b64)?;
+    let c = session.decrypt_with_trace(&response, &verifier, Some(&mut print_trace))?;
     if c.interval_seconds != 42 || c.batch_size != 3 || c.mail.enabled {
         return Err("synthetic configuration mismatch");
     }
@@ -59,16 +66,16 @@ fn debug_crypto(bridge: &str) -> Result<()> {
         let modified: config::Response =
             serde_json::from_value(value).map_err(|_| "invalid response")?;
         let error = session
-            .decrypt(&modified)
+            .decrypt(&modified, &verifier)
             .err()
             .ok_or("tampering was accepted")?;
         print_trace(
             serde_json::json!({"side":"test", "step":"tamper_rejected", "field":field, "reason":error}),
         );
     }
-    let other = config::Session::new(&device);
+    let other = config::Session::new(&profile)?;
     let error = other
-        .decrypt(&response)
+        .decrypt(&response, &verifier)
         .err()
         .ok_or("cross-session replay accepted")?;
     print_trace(
@@ -115,7 +122,7 @@ fn run(args: &[String]) -> Result<()> {
                     Zeroizing::new(serde_json::to_vec(&p).map_err(|_| "invalid credential")?);
                 platform::private_write(Path::new(&args[1]), &json)?;
                 save_profile(&root, &p)?;
-                println!("Device credential created; enroll its hash on the server.");
+                println!("Device credential created; enroll its public key on the server.");
                 return Ok(());
             }
             "--import-profile" => {
@@ -210,11 +217,11 @@ mod tests {
         let p = Profile::create();
         save_profile(&root, &p).unwrap();
         let loaded = load_profile(&root).unwrap();
-        assert!(loaded.access_token == p.access_token);
+        assert!(loaded.device_key == p.device_key);
         let data = fs::read(root.join("device-profile.dpapi")).unwrap();
         assert!(!data
-            .windows(p.access_token.len())
-            .any(|part| part == p.access_token.as_bytes()));
+            .windows(p.device_key.len())
+            .any(|part| part == p.device_key.as_bytes()));
         assert!(!root.join("config-key.dpapi").exists());
         let export = root.join("private.json");
         platform::private_write(&export, b"test").unwrap();
