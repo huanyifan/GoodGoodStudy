@@ -66,7 +66,7 @@ func run(args []string) error {
 			if e = saveProfile(root, p); e != nil {
 				return e
 			}
-			fmt.Println("Device credential created; enroll its hash on the server.")
+			fmt.Println("Device credential created; enroll its public key on the server.")
 			return nil
 		case "--import-profile":
 			if (len(args) != 2 && !(len(args) == 3 && args[2] == "--replace")) || (exists() && len(args) != 3) {

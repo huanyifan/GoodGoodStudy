@@ -6,6 +6,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,7 +20,19 @@ import (
 	"testing"
 )
 
-func fixture(t *testing.T, s *Session) Response {
+// testServerKey installs a throwaway server signing key for the whole test
+// binary and returns it so fixtures can sign responses the client will accept.
+func testServerKey(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
+	key, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if e != nil {
+		t.Fatal(e)
+	}
+	serverSigningKey = base64.StdEncoding.EncodeToString(elliptic.Marshal(elliptic.P256(), key.X, key.Y))
+	return key
+}
+
+func fixture(t *testing.T, s *Session, serverKey *ecdsa.PrivateKey) Response {
 	t.Helper()
 	secret, e := ecdh.P256().GenerateKey(rand.Reader)
 	if e != nil {
@@ -42,8 +56,8 @@ func fixture(t *testing.T, s *Session) Response {
 	info = append(info, public...)
 	info = append(info, s.nonce...)
 	info = append(info, nonce...)
+	info = append(info, be64(s.timestamp)...)
 	key := hkdf64(hashed[:], salt, info)
-	defer clear(key)
 	plain := []byte("{\"intervalSeconds\":42}")
 	padding := 16 - len(plain)%16
 	plain = append(plain, bytes.Repeat([]byte{byte(padding)}, padding)...)
@@ -55,28 +69,33 @@ func fixture(t *testing.T, s *Session) Response {
 	mac.Write([]byte("GoodGoodStudy.Config.v1|" + algorithm + "|"))
 	mac.Write(iv)
 	mac.Write(encrypted)
-	return Response{2, protocol, base64.StdEncoding.EncodeToString(public), base64.StdEncoding.EncodeToString(nonce), Envelope{1, algorithm, base64.StdEncoding.EncodeToString(iv), base64.StdEncoding.EncodeToString(encrypted), base64.StdEncoding.EncodeToString(mac.Sum(nil))}}
-}
-func TestSessionAuthentication(t *testing.T) {
-	p, _ := newProfile()
-	s, e := newSession(p.DeviceID)
+	signature, e := signTranscript(serverKey, responseTranscript(s.request.DeviceID, public, s.public, nonce, s.nonce, s.timestamp))
 	if e != nil {
 		t.Fatal(e)
 	}
-	r := fixture(t, s)
+	return Response{3, protocol, base64.StdEncoding.EncodeToString(public), base64.StdEncoding.EncodeToString(nonce), s.timestamp, signature, Envelope{1, algorithm, base64.StdEncoding.EncodeToString(iv), base64.StdEncoding.EncodeToString(encrypted), base64.StdEncoding.EncodeToString(mac.Sum(nil))}}
+}
+func TestSessionAuthentication(t *testing.T) {
+	serverKey := testServerKey(t)
+	p, _ := newProfile()
+	s, e := newSession(p)
+	if e != nil {
+		t.Fatal(e)
+	}
+	r := fixture(t, s, serverKey)
 	c, e := s.decrypt(r)
 	if e != nil || c.Interval != 42 {
 		t.Fatal("round trip failed", e)
 	}
-	other, _ := newSession(p.DeviceID)
+	other, _ := newSession(p)
 	if _, e = other.decrypt(r); e == nil {
 		t.Fatal("cross-session replay accepted")
 	}
-	different := fixture(t, s)
+	different := fixture(t, s, serverKey)
 	if different.Public == r.Public || different.Nonce == r.Nonce {
 		t.Fatal("ephemeral response reused")
 	}
-	for _, field := range []string{"mac", "iv", "nonce", "ciphertext"} {
+	for _, field := range []string{"mac", "iv", "nonce", "ciphertext", "signature"} {
 		bad := r
 		mutate := func(value string) string {
 			b, _ := base64.StdEncoding.DecodeString(value)
@@ -92,10 +111,20 @@ func TestSessionAuthentication(t *testing.T) {
 			bad.Nonce = mutate(bad.Nonce)
 		case "ciphertext":
 			bad.Payload.Ciphertext = mutate(bad.Payload.Ciphertext)
+		case "signature":
+			bad.Signature = mutate(bad.Signature)
 		}
 		if _, e = s.decrypt(bad); e == nil {
 			t.Fatalf("tampered %s accepted", field)
 		}
+	}
+	// A response from a different server signing key must be rejected.
+	forged := testServerKey(t)
+	s2, _ := newSession(p)
+	impostor := fixture(t, s2, forged)
+	testServerKey(t) // rotate the trusted key away from the impostor's key
+	if _, e = s2.decrypt(impostor); e == nil {
+		t.Fatal("response signed by untrusted key accepted")
 	}
 }
 func TestHKDFVector(t *testing.T) {
@@ -132,11 +161,28 @@ func TestProfileDPAPI(t *testing.T) {
 		t.Fatal("DPAPI roundtrip failed", e)
 	}
 	encrypted, _ := os.ReadFile(filepath.Join(root, "device-profile.dpapi"))
-	if bytes.Contains(encrypted, []byte(p.Token)) {
+	if bytes.Contains(encrypted, []byte(p.Key)) {
 		t.Fatal("credential stored as plaintext")
 	}
 	if _, e = os.Stat(filepath.Join(root, "config-key.dpapi")); !os.IsNotExist(e) {
 		t.Fatal("unexpected persistent AES key")
+	}
+}
+func TestProfileValidation(t *testing.T) {
+	p, _ := newProfile()
+	if validateProfile(p) != nil {
+		t.Fatal("fresh profile rejected")
+	}
+	for _, bad := range []Profile{
+		{p.DeviceID, ""},
+		{p.DeviceID, "not-base64!!"},
+		{p.DeviceID, base64.StdEncoding.EncodeToString(make([]byte, 16))},
+		{p.DeviceID, base64.StdEncoding.EncodeToString(make([]byte, 32))}, // zero scalar
+		{"short", p.Key},
+	} {
+		if validateProfile(bad) == nil {
+			t.Fatalf("invalid profile accepted: %+v", bad)
+		}
 	}
 }
 func TestPrivateExport(t *testing.T) {
