@@ -29,8 +29,16 @@ function New-WatchdogTaskXml([string]$Exe, [string]$Script, [string]$Url, [strin
         }
     }
     $escape = { param($value) [Security.SecurityElement]::Escape([string]$value) }
-    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Mode Watchdog -ExecutablePath "{1}" -ConfigUrl "{2}"' -f $Script,$Exe,$urlValue
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    # Run the per-minute watchdog through a hidden VBScript launcher so Task Scheduler
+    # never flashes a console window in the interactive desktop session.
+    $vbsPath = Join-Path ([IO.Path]::GetDirectoryName($Script)) 'GoodGoodStudy-Watchdog.vbs'
+    if ($vbsPath.Contains('"')) { throw 'Autostart requires absolute local file paths.' }
+    $psCommand = '{0} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{1}"" -Mode Watchdog -ExecutablePath ""{2}"" -ConfigUrl ""{3}""' -f $powershell,$Script,$Exe,$urlValue
+    $vbsBody = 'CreateObject("WScript.Shell").Run "' + $psCommand + '", 0, False' + "`r`n"
+    [IO.File]::WriteAllText($vbsPath, $vbsBody, (New-Object Text.UTF8Encoding($false)))
+    $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $arguments = '//B //Nologo "{0}"' -f $vbsPath
     $start = (Get-Date).AddMinutes(1).ToString('yyyy-MM-ddTHH:mm:ss')
     return @"
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -47,7 +55,7 @@ function New-WatchdogTaskXml([string]$Exe, [string]$Script, [string]$Url, [strin
     <AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden>
     <WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT45S</ExecutionTimeLimit>
   </Settings>
-  <Actions Context="CurrentUser"><Exec><Command>$(& $escape $powershell)</Command><Arguments>$(& $escape $arguments)</Arguments><WorkingDirectory>$(& $escape ([IO.Path]::GetDirectoryName($Exe)))</WorkingDirectory></Exec></Actions>
+  <Actions Context="CurrentUser"><Exec><Command>$(& $escape $wscript)</Command><Arguments>$(& $escape $arguments)</Arguments><WorkingDirectory>$(& $escape ([IO.Path]::GetDirectoryName($Exe)))</WorkingDirectory></Exec></Actions>
 </Task>
 "@
 }
@@ -96,8 +104,17 @@ function Invoke-CaptureWatchdog([string]$Exe, [string]$Url, [string]$Directory) 
         if (-not $acquired -or (Test-CaptureRunning)) { return }
         if (Test-Path -LiteralPath (Join-Path $Directory 'autostart-disabled')) { return }
         $normalized = Assert-ConfigUrl $Url
-        # Start-Process starts a separate program, never a thread inside explorer.exe.
-        $process = Start-Process -FilePath $Exe -ArgumentList @('--config-url',('"' + $normalized + '"')) -WorkingDirectory ([IO.Path]::GetDirectoryName($Exe)) -WindowStyle Hidden -PassThru
+        # Launch as a separate program with no console window. The client is a console
+        # subsystem binary, so CreateNoWindow (not just -WindowStyle Hidden) is required
+        # to avoid a black window appearing when the watchdog starts it.
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.Arguments = '--config-url "' + $normalized + '"'
+        $psi.WorkingDirectory = [IO.Path]::GetDirectoryName($Exe)
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $process = [Diagnostics.Process]::Start($psi)
         $record = @{ Id=$process.Id; ExecutablePath=$Exe; StartTimeUtcTicks=$process.StartTime.ToUniversalTime().Ticks }
         if (Test-Path -LiteralPath (Join-Path $Directory 'autostart-disabled')) {
             $process.Kill()
