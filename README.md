@@ -7,7 +7,7 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 - 两份程序共用协议、DPAPI 设备凭据格式及 Windows 互斥锁，一次选择一份运行。
 - 根目录 VB.NET 项目保留为迁移参考与协议互操作测试基线，不是原生发布包的运行依赖。
 
-本版修复空路径、批次越界、ZIP 重名和资源释放问题，提供邮件失败队列、登录自启动与每分钟进程守护。配置采用 **设备鉴权 + HTTPS + 每次请求临时 ECDH 密钥协商 + AES-256-CBC/HMAC-SHA256**。
+本版修复空路径、批次越界、ZIP 重名和资源释放问题，提供邮件失败队列、登录自启动与每分钟进程守护。配置采用 **v3 双向签名鉴权 + HTTPS + 每次请求临时 ECDH 密钥协商 + AES-256-CBC/HMAC-SHA256**：客户端用设备私钥对请求签名，服务端用长期私钥对响应签名（客户端内置其公钥），即使 TLS 被中间人终止，也无法伪造配置或重放请求。
 
 ## Rust 一键安装（主要发布方式）
 
@@ -15,7 +15,7 @@ Windows 定时截图与邮件批次发送工具，基于 [Sanhom365/GoodGoodStud
 
 开始菜单的 GoodGoodStudy 文件夹提供状态、停用、启用和卸载入口；Windows 的已安装应用中也有卸载入口。卸载停止程序、移除任务和安装文件，保留 `%LOCALAPPDATA%\GoodGoodStudy` 中的截图、日志与设备凭据。安装时不能联网也可完成本地配置，守护任务之后重试获取远端配置。
 
-个人安装包内置长期**设备访问凭据**，持有人能够提取它并请求配置，必须私下保管，不能发布到 GitHub、公开下载目录或共享盘。临时 ECDH 私钥和会话加密密钥仍只存在于运行内存中。安装过程不会把内置凭据解压为明文文件。
+个人安装包内置长期**设备私钥**，持有人能够提取它并以该设备身份请求配置，必须私下保管，不能发布到 GitHub、公开下载目录或共享盘。临时 ECDH 私钥和会话加密密钥仍只存在于运行内存中。安装过程不会把内置凭据解压为明文文件。
 
 管理员在本机使用已登记的设备凭据构建：
 
@@ -77,15 +77,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Autostart.ps1 -M
 
 每次获取配置：
 
-1. 客户端生成内存中的临时 P-256 ECDH 私钥、公钥和 32 字节随机 nonce；提交设备 ID、公钥、nonce，并在 HTTPS Authorization 中携带设备访问凭据。
-2. 服务端验证凭据哈希，生成新的临时 ECDH 密钥和 nonce。
-3. 双方计算 ECDH 共享秘密，先 SHA-256，再按 RFC 5869 HKDF-SHA256 派生本次 64 字节会话材料。HKDF salt 为双方 nonce 拼接；info 包含协议标识、设备 ID、双方公钥与 nonce。
-4. 前 32 字节用于 AES-256-CBC，后 32 字节用于 HMAC-SHA256；随机 IV、PKCS7 填充，先认证再解密。响应只含公钥、nonce、IV、密文和 MAC。
-5. 客户端解密并验证配置，清理派生数组、释放临时 CNG 密钥。应用不序列化或记录 ECDH 私钥、共享秘密或会话加密密钥；服务端同样不持久化它们。
+1. 客户端生成内存中的临时 P-256 ECDH 私钥、公钥和 32 字节随机 nonce，带上当前时间戳；再用**设备私钥（ECDSA P-256）**对 `设备ID‖临时公钥‖nonce‖时间戳` 签名，一起提交。请求不再携带 Bearer 令牌。
+2. 服务端用登记的设备公钥验签；检查时间戳在 ±300 秒内、nonce 未被用过（防重放）；按 IP 限流在验签之前。随后生成新的临时 ECDH 密钥和 nonce。
+3. 双方计算 ECDH 共享秘密，先 SHA-256，再按 RFC 5869 HKDF-SHA256 派生本次 64 字节会话材料。HKDF salt 为双方 nonce 拼接；info 包含协议标识、设备 ID、双方公钥、双方 nonce 与时间戳。
+4. 前 32 字节用于 AES-256-CBC，后 32 字节用于 HMAC-SHA256；随机 IV、PKCS7 填充，先认证再解密。服务端再用**长期签名私钥**对 `服务端公钥‖客户端公钥‖双方 nonce‖设备ID‖时间戳` 签名。响应含公钥、nonce、时间戳、服务端签名、IV、密文和 MAC。
+5. 客户端先用内置的服务端公钥验签（任何一步不符即拒绝），再做 ECDH、验 MAC、解密并验证配置，清理派生数组、释放临时 CNG 密钥。应用不序列化或记录任何私钥、共享秘密或会话加密密钥；服务端同样不持久化它们。
 
-算法名称、公钥和 IV 可以公开，不是解密密钥。TLS 仍负责服务器身份验证和访问凭据的传输保护。不能为了额外 ECDH 加密而跳过 TLS 证书校验。
+算法名称、公钥和 IV 可以公开，不是解密密钥。服务端签名使客户端不再只依赖 TLS 确认服务器身份：即便证书被中间人替换，伪造的配置也会因签名不符被拒。仍应保留 TLS，且不能跳过证书校验。
 
-设备凭据保存在 %LOCALAPPDATA%\GoodGoodStudy\device-profile.dpapi，由当前用户 DPAPI 保护；它是长期访问权限，持有者可以请求新配置，但不能直接解密以前捕获的独立会话。服务端只保存凭据 SHA-256 哈希。每台设备建议单独登记，以便单独撤销。
+设备私钥保存在 %LOCALAPPDATA%\GoodGoodStudy\device-profile.dpapi，由当前用户 DPAPI 保护；它是长期身份，持有者可以请求新配置，但不能直接解密以前捕获的独立会话。服务端只保存设备公钥（旧 v2 设备保存令牌 SHA-256 哈希，迁移期内继续受理）。每台设备建议单独登记，以便单独撤销。服务端的长期签名私钥保存在数据目录 signing-key.json（权限 0600），不进镜像、不进 Git；其公钥编译进客户端。
 
 创建、导出与导入设备凭据：
 
@@ -95,7 +95,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Autostart.ps1 -M
 .\GoodGoodStudy.exe --import-profile C:\private\client-profile.json
 ~~~
 
-导出文件以当前用户独占 ACL 创建。创建后必须在服务端登记才有访问权限。服务器管理员可在可信管理电脑使用：
+导出文件以当前用户独占 ACL 创建。创建后必须在服务端登记才有访问权限。首次部署 v3 时，先在服务器生成长期签名密钥，并把打印出的公钥填入客户端源码常量（Go 的 `serverSigningKey`、Rust 的 `SERVER_SIGNING_KEY`）后再编译发布：
+
+~~~powershell
+python -B .\server\config_admin.py --keygen-signing-key C:\data\signing-key.json
+~~~
+
+服务器管理员在可信管理电脑登记每台设备（v3 存公钥，v2 旧凭据存哈希，命令相同）：
 
 ~~~powershell
 python -B .\server\config_admin.py --profile C:\private\client-profile.json --devices C:\private\devices.json
@@ -121,7 +127,8 @@ handle /tools/goodgoodstudy/config.json {
 其他 tools 静态文件继续原方式服务。容器只读、无额外 capability、非 root UID、关闭 core dump，并设内存/PID/日志上限。数据只读挂载到 /data：
 
 - config.json：真实配置，包括邮箱设置。放在非公开目录，文件权限 0400。
-- devices.json：设备 ID 到访问凭据 SHA-256 哈希的映射，同样为私有文件。
+- devices.json：设备 ID 到设备公钥（v3）或访问凭据 SHA-256 哈希（v2）的映射，私有文件。
+- signing-key.json：服务端长期签名私钥，私有文件，权限 0600，置于数据目录，不进镜像与 Git。
 
 服务端长期配置是私有文件；临时加密密钥不写盘。并发限制 16，每台已授权设备每分钟最多 60 次请求；请求体最大 4 KiB。日志不记录 Authorization、请求/响应正文或密钥。
 
